@@ -1,0 +1,14 @@
+{
+  "name": "asap-scaffold",
+  "private": true,
+  "workspaces": [
+    "web",
+    "mobile",
+    "programs/*"
+  ],
+  "scripts": {
+    "bootstrap": "npm install --workspaces",
+    "start:web": "npm --workspace web run dev",
+    "start:mobile": "npm --workspace mobile start"
+  }
+}

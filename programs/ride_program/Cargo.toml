@@ -1,0 +1,11 @@
+[package]
+name = "ride_program"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ride_program"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+anchor-lang = "0.30.1"
