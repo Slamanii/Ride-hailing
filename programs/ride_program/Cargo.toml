@@ -8,4 +8,4 @@ name = "ride_program"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-anchor-lang = "0.30.1"
+anchor-lang = "0.31.1"

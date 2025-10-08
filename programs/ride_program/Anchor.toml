@@ -1,9 +1,0 @@
-[programs.localnet]
-ride_program = "target/deploy/ride_program.so"
-
-[provider]
-cluster = "localnet"
-wallet = "~/.config/solana/id.json"
-
-[scripts]
-test = "mocha -r ts-node/register tests/**/*.ts"
