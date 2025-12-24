@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "programs/ride_program",
-    "logic"
 ]
 
 [programs.localnet]
@@ -11,7 +10,7 @@ courier = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg6Zt3b9r5Mi"
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "localnet"
+cluster = "devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

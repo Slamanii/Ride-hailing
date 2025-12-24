@@ -1,230 +1,422 @@
-use actix_web::{rt::{time}, get, post, web, Scope, HttpResponse, Responder};
-use serde::{Deserialize, Serialize};
+use actix_web::{ get, post, web, Scope, HttpResponse, Responder};
+use serde::{ Deserialize, Serialize };
+use diesel::dsl::sql;
+use serde_json::Value;
+use tokio::sync::{Mutex, oneshot};
+use lazy_static::lazy_static;
 use diesel::prelude::*;
-use crate::db::{PgPool};
-use crate::api::admin::{Rider, NewRider, Driver};
-use crate::services::{pricing, escrow};
+use diesel::pg::PgConnection;
+use uuid::Uuid;
+use tokio::time::{ Duration, sleep, timeout };
+use reqwest::Client;
+use std::collections::HashMap;
+use crate::db::{ DbPool };
+use crate::api::admin::{ Rider, NewRider };
+use crate::services::{escrow, pricing::{ GeoPoint, minimum_distance_between_driver_and_pickup, distance_between }};
+use crate::services::pricing;
 use crate::services::notifications::calculate_eta;
+use crate::api::drivers::{ DriverResponse, DriverResponsePayloadOut, DriverInfo, Driver };
 
-
-async fn assign_driver(ride_type: &RideType, pool: &PgPool) ->
-Result<DriverInfo, String> {
-    //Source for driver data from db
-    use crate::schema::drivers::dsl::*;
-    let connection = &mut pool.get.expect("DB connection failed");
-
-    //Filter drivers by ride type/ vehicle type
-    let vehicle_filter = match ride_type {
-        RideType::ASAP => vec!["EV".to_string()],
-        RideType::ASAPEXPRESS =>  vec!["Bike".to_string()],
-    };
-     
-    for attempt in 1..=4 {
-        let available_driver = drivers
-        .filter(vehicle.eq_any(&vehicle_filter))
-        .limit(1)
-        .load::<Driver>(&mut connection)
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .next();
-
-        if let Some(driver) = available_driver {
-
-    // Here you could mark driver as “assigned” in DB
-
-            return Ok(DriverInfo {
-                id: driver.id,
-                name: driver.name,
-                phone: driver.phone,
-                vehicle: driver.vehicle,
-            });
-        }
-
-        time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-    
-    Err("No driver available after 4 attempts, please try again".into())
+lazy_static! {
+    pub static ref DRIVER_RESPONSES: Mutex<HashMap<Uuid, oneshot::Sender<DriverResponse>>> = Mutex::new(HashMap::new());
 }
 
-#[post("/riders/request_ride")]
 
-fn validate_rider_account(
-    conn: &mut PgConnection,
-    rider_id: uuid::Uuid
+pub async fn assign_driver_handler(
+    body: web::Json<NewRideRequest>,
+    pool: web::Data<DbPool>,
+) -> HttpResponse {
+
+    use crate::schema::drivers::dsl::*;
+
+    let pick_up_geo2: GeoPoint = serde_json::from_value(body.pick_up.clone()).expect("Failed to convert pick_up JSON to GeoPoint");
+    let drop_off_geo2: GeoPoint = serde_json::from_value(body.drop_off.clone()).expect("Failed to convert drop_off JSON to GeoPoint");
+
+    let distance_km = pricing::distance_between(&pick_up_geo2, &drop_off_geo2);
+    let estimated_time_min = body.estimated_time_min;
+    let estimated_arrival: String = calculate_eta(estimated_time_min);
+
+    //calculate price and estimated time based on ride type
+    let ride_type2: RideType = serde_json::from_value(body.ride_type.clone())
+                                         .expect("Failed to parse ride type");
+
+    let estimated_price: i64 = match &ride_type2 {
+        RideType::ASAP => pricing::calculate_asap(distance_km, estimated_time_min),
+        RideType::ASAPEXPRESS => pricing::calculate_express(distance_km, estimated_time_min),
+    };
+
+    
+     let cancel_reasons = vec![
+        "Change of plans".to_string(),
+        "Driver taking too long".to_string(),
+        "Found alternate transport".to_string(),
+        "Incorrect destination".to_string(),
+    ];
+
+    // Filter by ride type (maps to vehicle_type in DB)
+    let vehicle_filter = match &ride_type2 {
+        RideType::ASAP => vec!["EV".to_string()],
+        RideType::ASAPEXPRESS => vec!["Bike".to_string()],
+    };
+
+    for _ in 1..=4 {
+        let available_drivers = web::block({
+            
+            let pool = pool.clone();
+            let vehicle_filter = vehicle_filter.clone();
+
+            move || {
+
+            let mut connection = match pool.get() {
+                                 Ok(conn) => conn,
+                                 Err(_) => return Err("Failed to get DB connection"),
+    };
+
+            drivers.filter(vehicle_type.eq_any(&vehicle_filter))
+                   .filter(status.eq("available")) //treat
+                   .limit(10)
+                   .select(Driver::as_select())
+                   .load::<Driver>(&mut connection)
+                   .map_err(|_| "DB query error")
+                }
+                
+            }).await;
+
+        match available_drivers {
+            Ok(Ok(list)) if !list.is_empty() => {
+                for driver in list {
+
+                        let driver_info: DriverInfo = DriverInfo {
+                            name: driver.name.clone(),
+                            phone: driver.phone.clone(),
+                            //rating: driver.rating,
+                            vehicle: driver.vehicle.clone(),
+                            license_number: driver.license_number.clone(),
+                        };
+
+
+                        let pick_up_geo: GeoPoint = serde_json::from_value(body.pick_up.clone())
+                                                                .expect("Failed to convert pick_up JSON to GeoPoint");
+
+                    if minimum_distance_between_driver_and_pickup(
+                        pick_up_geo,
+                        driver.location().clone(),
+                    ) {
+                        // ✅ Optional: mark driver as assigned
+                        // let _ = diesel::update(drivers.filter(id.eq(driver.id)))
+                        //     .set(status.eq("assigned"))
+                        //     .execute(&mut connection);
+
+                        // ✅ Send notification to driver app/server
+                    let (tx, rx) = oneshot::channel();
+                    DRIVER_RESPONSES.lock().await.insert(driver.driver_id, tx);
+
+                    // Notify driver
+                    let notify_url = format!("http://localhost:8080/notify-driver/{}", driver.driver_id);
+                    let client = reqwest::Client::new();
+                    let resp = client.post(&notify_url).json(&body).send().await.expect("Failed to send notification");
+
+                if resp.status().is_success() {
+                // Wait for that driver's response
+                    
+    match timeout(Duration::from_secs(50), rx).await {
+    Ok(Ok(other_driver_response)) => match other_driver_response {
+        DriverResponse::Accepted => {
+            let ride_assignment = RideAssignment {
+                estimated_price,
+                estimated_time_min,
+                estimated_arrival,
+                validation_status: "driver is on his way.".into(),
+                driver_assigned: Some(driver_info),
+                message: Some("your package will be with you shortly.".into()),
+                cancel_ride: Some(cancel_reasons),
+            };
+            println!("Driver {} accepted ride", driver.driver_id);
+            return HttpResponse::Ok().json(ride_assignment);
+        }
+        DriverResponse::Rejected => {
+            println!("Driver {} rejected ride", driver.driver_id);
+            continue;
+        }
+        DriverResponse::Timeout => {
+            println!("Driver {} did not respond", driver.driver_id);
+            continue;
+        }
+    },
+    Ok(Err(_recv_error)) => {
+        println!("Driver {} channel failed", driver.driver_id);
+        continue;
+    },
+    Err(_elapsed) => {
+        println!("Driver {} timed out", driver.driver_id);
+        continue;
+    },
+}
+
+                        
+                        
+             }
+
+        }
+    
+    }
+    
+}
+         Ok(Ok(_)) => {
+                // no driver found, wait and retry
+                sleep(Duration::from_millis(500)).await;
+            },
+            Ok(Err(inner_err)) => eprintln!("Db error: {}", inner_err),
+            
+            Err(e) => {
+                eprintln!("DB error: {}", e);
+                return HttpResponse::InternalServerError().body("Database query failed");
+            },
+    }
+}
+
+    HttpResponse::NotFound().body("No suitable driver available after 4 attempts")
+}
+
+
+
+
+
+pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>, driver_id: web::Path<Uuid>) -> impl Responder {
+    let data = payload.into_inner();
+    let driver_id = driver_id.into_inner();
+
+    // Extract driver_id and response together
+    let (driver_id, response) = match data {
+        DriverResponsePayloadOut::Accepted {
+            rider_id: _rider_id, // keep if needed
+            driver_id,
+            message: _message,   // keep if needed
+        } => (driver_id, DriverResponse::Accepted),
+
+        DriverResponsePayloadOut::Rejected {
+            driver_id,
+        } => (driver_id, DriverResponse::Rejected),
+    };
+
+    // Use driver_id to look up the response channel
+    if let Some(tx) = DRIVER_RESPONSES.lock().await.remove(&driver_id) {
+        let _ = tx.send(response);
+    }
+
+    HttpResponse::Ok().json("Response received")
+}
+
+
+
+
+
+ pub fn validate_rider_account(
+    connection: &mut PgConnection,
+    rider_id: Uuid
 ) -> Result<Rider, String> {
     use crate::schema::riders::dsl::*;
 
     let rider: Rider = riders
         .find(rider_id)
-        .first::<Rider>(conn)
+        .select(Rider::as_select())
+        .first::<Rider>(connection)
         .map_err(|_| "Rider not found".to_string())?;
-
-    if rider.status != "active" {
-        return Err("Rider account inactive".into());
-    }
 
     Ok(rider)
 }
 
-
-async fn request_ride(
-    pool: web::Data<PgPool>,
-    body: web::Json<RideRequest>,
+pub async fn request_ride(
+    pool: web::Data<DbPool>,
+    body: web::Json<CreateRideRequest>,
 ) -> HttpResponse {
+    use crate::schema::ride_request::dsl::*;
+
     let req = body.into_inner();
 
+    let rider_uuid = req.rider_id;
 
 
-    //validate rider account (simplified)
-    if validate_rider_account(req.rider_id, &mut pool.get().unwrap()) != "active" {
-        return HttpResponse::Forbidden().json(RideAssignment {
-            estimated_price: 0.0,
-            estimated_time_min: 0,
-            estimated_arrival: None,
-            validation_status: "failed".into(),
-            driver_assigned: None,
-            message: Some("Rider account inactive".into())
-        });
+    let new_ride_request = NewRideRequest::new(req);
+
+
+    let validation_status = web::block({
+    let pool = pool.clone();
+    move || {
+        let mut conn = pool.get().unwrap();
+        validate_rider_account(&mut conn, rider_uuid)
+            .map_err(|e| format!("rider validation error: {}", e))?;
+
+        diesel::insert_into(ride_request)
+            .values(new_ride_request)
+            .execute(&mut conn)
+            .map_err(|e| format!("DB insert error: {}", e))
+
+    }
+}).await;
+
+let status = match validation_status {
+    Ok(Ok(status)) => status,
+
+    Ok(Err(db_err)) => {
+        return HttpResponse::InternalServerError()
+            .body(format!("DB error: {}", db_err));
     }
 
-    //calculate price and estimated time based on ride type
-    let (estimated_price, estimated_time_min) = match req.ride_type {
-        RideType::ASAP => pricing::calculate_asap(&req.pick_up, &req.drop_off),
-        RideType::ASAPEXPRESS => pricing::caluclate_express(&req.pick_up, &req.drop_off),
+    Err(block_err) => {
+        return HttpResponse::InternalServerError()
+            .body(format!("Blocking error: {}", block_err));
     }
+};
 
-    
-    //Vaidate items
-    if let Some(items) = &req.items {
-        for item in items {
-            if item.quantity <= 0 || item.weight <= 0.0 {
-                return HttpResponse::BadRequest().json(RideAssignment {
-                    estimated_price: 0.0,
-                    estimated_time_min: 0,
-                    estimated_arrival: None,
-                    validation_status: "failed".into(),
-                    driver_assigned: None,
-                    message: Some(format!("Invalid item: {:?}", item)),
-                });
-            }
-        }
-    }
+HttpResponse::Ok().json(status)
 
-    //verify payment /escrow
-    if !escrow::verify_payment(&req.rider_id, &req.payment_method, estimated_price) {
-        return HttpResponse::PaymentRequired().json(RideAssignment {
-            estimated_price,
-            estimated_time_min,
-            estimated_arrival: None,
-            validation_status: "failed".into(),
-            driver_assigned: None,
-            message: Some("Payment verification failed".into()),
-        });
-    }
-
-     let eta_timestamp = calculate_eta(estimated_time_min);
-    
-    //Assign driver
-    match assign_driver(&req.ride_type, &pool).await {
-        Ok(driver) => HttpResponse::Ok().json(RideAssignment {
-            estimated_price,
-            estimated_time_min,
-            estimated_arrival: Some(eta_timestamp),
-            validation_status: "failed".into(),
-            driver_assigned: None,
-            message: Some("Payment verification failed".into()),
-        })
-    },
-    Err(err_msg) => HttpResponse::ServiceUnavailable().json(RideAssignment {
-        estimated_price,
-        estimated_time_min,
-        estimated_arrival: Some(eta_timestamp),
-        validation_status: "failed".into(),
-        driver_assigned: None,
-        message: Some(err_msg),
-    }),
 
 }
 
-#[derive(Deserialize)]
+pub fn routes() -> Scope {
+    web::scope("/riders")
+        .route("/assign-driver", web::get().to(assign_driver_handler))
+        .route("/wait-driver-response", web::get().to(driver_response))
+        .route("/ride-request", web::post().to(request_ride))
+}
+
+#[derive(Deserialize, Serialize, Clone)]
 pub enum RideType {
     ASAP,
     ASAPEXPRESS,
 }
 
-#[derive(Deserialize)]
-pub struct RideRequest {
-    pub rider_id: i32,
-    pub pick_up: String,
-    pub drop_off: String,
-    pub ride_type: RideType,
-    pub items: Vec<ItemDetails>,
-    pub payment_method: String,
-} 
 
-#[derive(Serialize)]
+///The whole thing needs work
+#[derive(Deserialize)]
+pub struct CreateRideRequest {
+    pub rider_id: Uuid,
+    pub pick_up: GeoPoint,
+    pub drop_off: GeoPoint,
+    pub ride_type: RideType,
+    pub payment_method: String,
+    pub items: Vec<ItemDetails>,
+}
+
+#[derive(Deserialize, Serialize, Insertable, Clone)]
+#[diesel(table_name = crate::schema::ride_request)]
+pub struct NewRideRequest {
+    pub request_id: Uuid,
+    pub rider_id: Uuid,
+    pub pick_up: serde_json::Value,
+    pub drop_off: serde_json::Value,
+    pub estimated_price: i64,
+    pub distance_km: f64,
+    pub estimated_time_min: i32,
+    pub ride_type: serde_json::Value,
+    pub items: serde_json::Value,
+    pub payment_method: String,
+}
+
+
+impl NewRideRequest {
+    pub fn new(req: CreateRideRequest) -> Self {
+
+        let distance_km = distance_between(&req.pick_up, &req.drop_off);
+        let estimated_time_min =
+            pricing::estimated_time_min(distance_km, &req.ride_type);
+
+        let estimated_price = match req.ride_type {
+            RideType::ASAP => pricing::calculate_asap(distance_km, estimated_time_min),
+            RideType::ASAPEXPRESS => pricing::calculate_express(distance_km, estimated_time_min),
+        };
+
+        Self {
+            request_id: Uuid::new_v4(),
+            rider_id: req.rider_id,
+            pick_up: serde_json::to_value(&req.pick_up).expect("serialize pick_up"),
+            drop_off: serde_json::to_value(&req.drop_off).expect("serialize drop_off"),
+            ride_type: serde_json::to_value(&req.ride_type).expect("serialize ride_type"),
+            items: serde_json::to_value(&req.items).expect("serialize items"),
+            estimated_price,
+            distance_km,
+            estimated_time_min,
+            payment_method: req.payment_method,
+        }
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Queryable, Selectable)]
+#[diesel(table_name = crate::schema::ride_request)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct RideRequest {
+    pub request_id: Uuid,
+    pub rider_id: Uuid,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub pick_up: serde_json::Value,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub drop_off: serde_json::Value,
+    pub estimated_price: i64,
+    pub distance_km: f64,
+    pub estimated_time_min: i32,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub ride_type: serde_json::Value,
+    pub items: serde_json::Value,
+    pub payment_method: String,
+}
+
+
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct RideAssignment {
-    pub estimated_arrival: Option<String>,
-    pub estimated_time_min: u32,
-    pub estimated_price: u64,
+    pub estimated_arrival: String,
+    pub estimated_time_min: i32,
+    pub estimated_price: i64,
     pub validation_status: String,
     pub driver_assigned: Option<DriverInfo>,
-    pub message: Option<String>,
+    pub message: Option<String>, 
+    pub cancel_ride: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ItemDetails {
     pub name: String,
-    pub quantity: u32,
     pub price: u64,
-    pub weight: f64, // in kg
     pub dimensions: (f64, f64, f64), // (length, width, height) in cm
+    pub quantity: u32,
+    pub weight: f64, // in kg
+    
 }
 
-#[derive(Serialize)]
-pub struct DriverInfo {
-    pub id: i32,
-    pub name: String,
-    pub phone: String,
-    pub vehicle: Option<String>,
+impl ItemDetails {
+    pub fn max_dimensions(&self) -> Result<(), String> {
+        let (length, width, height) = self.dimensions;
+        
+
+        if (length, width, height) > (13.0, 13.0, 13.0)  {
+            return Err("Sorry, we cant handle items of this size.".into());
+        }
+            Ok(())
+    } 
+
+    pub fn aggregate_quantity(&self) -> Result<(), String> {
+            let mut total_number_of_items = self.quantity;
+            let max_number_of_items = 10;
+
+            if total_number_of_items > max_number_of_items {
+                return Err("Too many Items".into());
+            }
+
+            Ok(())
+        }
+
+    pub fn max_weight(&self) -> Result<(), String> {
+         let total_weight = self.weight * self.quantity as f64;
+        
+         if total_weight > 5.0 {
+            return Err("Sorry, we cant handle items of this size.".into());
+        }
+
+        Ok(())
+   }
+
+
 }
 
-
-
-
-
-// from escrow .rs or to escrow.rs
-use serde::Serialize;
-use solana_sdk::pubkey::Pubkey;
-
-#[derive(Serialize, Clone)]
-pub struct Trip {
-    pub ride_id: [u8; 32],
-    pub rider_pubkey: Pubkey,
-    pub driver_id: String,
-    pub start_ts: u64,
-    pub end_ts: u64,
-    pub start_lat: i32,
-    pub start_lon: i32,
-    pub end_lat: i32,
-    pub end_lon: i32,
-    pub distance_m: u32,
-    pub fare_lamports: u64,
-}
-
-pub async fn get_trip_by_reference(reference: &str) -> anyhow::Result<Trip> {
-    // fetch from database
-    Ok(Trip {
-        ride_id: sha2::Sha256::digest(reference.as_bytes()).into(),
-        rider_pubkey: Pubkey::new_unique(),
-        driver_id: "driver123".into(),
-        start_ts: 1696000000,
-        end_ts: 1696003000,
-        start_lat: 64000000,
-        start_lon: 3400000,
-        end_lat: 64010000,
-        end_lon: 3401000,
-        distance_m: 2500,
-        fare_lamports: 1_000_000,
-    })
-}

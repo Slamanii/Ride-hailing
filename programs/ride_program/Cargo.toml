@@ -8,4 +8,14 @@ name = "ride_program"
 crate-type = ["cdylib", "lib"]
 
 [dependencies]
-anchor-lang = "0.31.1"
+anchor-lang = { version = "=0.32.1", features = ["init-if-needed"] }
+anchor-spl = "0.32.1"
+anchor-attribute-program = "=0.32.1"
+anchor-derive-accounts = "=0.32.1"
+solana-program-entrypoint = "=2.3.0"
+
+
+
+
+[dev-dependencies]
+litesvm = "0.8.1"

@@ -1,0 +1,34 @@
+use ts_rs::TS;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/bindings/")]
+pub struct DriverResponsePayload {
+    pub driver_id: String,
+    pub ride_id: String,
+    pub response: String,
+}
+
+///add more structs as needed
+// Example structs
+#[derive(Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/bindings/")]
+pub struct DriverInfo {
+    pub name: String,
+    pub phone: String,
+    pub rating: Option<f32>,
+    pub vehicle: Option<String>,
+    pub license_number: Option<String>,
+}       
+
+///add other data types as needed
+// Example enum
+#[derive(Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../frontend/src/bindings/")]
+pub enum RideType {
+    ASAP,
+    ASAPEXPRESS,
+}
+
+//to run use cd logic, cargo build
+//import in frontend as import { DriverResponsePayload, DriverInfo, RideType } from './bindings/logic';

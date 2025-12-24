@@ -1,26 +1,33 @@
-use actix_web::{get, web, App, HttpServer, Responder};
-use dotenvy::dotenv;
-use std::env;
 mod api;
+mod services;
+mod db;
+mod config;
+mod schema;
 
-#[get("/health")]
-async fn health() -> impl Responder {
-    "Backend is alive 🚀"
-}
+use actix_web::{ web, App, HttpServer };
+use dotenv::dotenv;
+use crate::config::AppConfig;
+use crate::db::init_pool; 
 
-#[tokio::main]
+
+
+
+#[actix_web::main]
 async fn main() -> std::io::Result<()> {
 
     dotenv().ok();
+    let app_config = AppConfig::from_env();
 
-    let db_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
-    let pool = logic::db::init_pool(db_url);
+    // Initialize DB pool
+    let pool = init_pool(&app_config.database_url);
 
 
-    HttpServer::new(|| {
+
+    HttpServer::new(move || {
         App::new()
         .app_data(web::Data::new(pool.clone()))
         .configure(api::init)
+        .configure(services::init)
 })
         .bind(("127.0.0.1", 8080))?
         .run()

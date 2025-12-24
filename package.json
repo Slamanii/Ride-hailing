@@ -4,11 +4,14 @@
   "workspaces": [
     "web",
     "mobile",
-    "programs/*"
+    "programs/*",
+    "logic"
   ],
   "scripts": {
     "bootstrap": "npm install --workspaces",
     "start:web": "npm --workspace web run dev",
-    "start:mobile": "npm --workspace mobile start"
+    "start:mobile": "npm --workspace mobile start",
+    "generate:types": "cd logic && cargo build",
+    "dev": "npm run generate:types && next dev"
   }
 }

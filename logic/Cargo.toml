@@ -10,32 +10,44 @@ default-run = "logic"
 # Web framework
 actix-web = "4"            # HTTP server & routing
 actix-rt = "2"             # Async runtime for Actix
+ts-rs = "10"
 
 
 # Serialization / Deserialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+diesel = { version = "2.1", features = ["postgres", "r2d2", "uuid", "serde_json"] }
 
-diesel = { version = "2.1", features = ["postgres"] }
+
 
 # Logging
 env_logger = "0.11"
 log = "0.4"
 
 # Utilities
-uuid = { version = "1", features = ["v4"] }   # For IDs
+uuid = { version = "1", features = ["serde", "v4"] }   # For IDs
 chrono = "0.4"                                # For timestamps
 
-# Solana interaction (if backend will talk to Solana RPC)
-anchor-client = "0.31.1"
-solana-sdk = "2.0.25"
+# Solana interaction (while backend talks to Solana RPC)
+ride_program = { path = "../programs/ride_program" }
+anchor-client = "0.32.1"
 solana-program = "2.0.25"
 solana-client = "2.0.25"
+solana-sdk = "2.0.25"
+dotenv = "0.15.0"
+reqwest = { version = "0.11", features = ["json"] }
+tokio = "1"
+sha2 = "0.10.9"
+lazy_static = "1.5.0"
+anchor-spl = "0.32.1"
+hex = "0.4.3"
+anyhow = "1.0.100"
 
 
 
 # Testing (only used when you run cargo test)
 [dev-dependencies]
+litesvm = "0.8.1"
 reqwest = { version = "0.11", features = ["json"] } # For API integration tests
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 

@@ -3,8 +3,8 @@ use solana_sdk::pubkey::Pubkey;
 
 pub struct AppConfig {
     pub database_url: String,
-    pub paystack_secret: String,
-    pub solana_program_id: Pubkey,
+    pub secret_key: String,
+    pub program_id: Pubkey,
     pub solana_rpc_url: String,
 }
 
@@ -14,8 +14,8 @@ impl AppConfig {
 
         Self {
             database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
-            paystack_secret: env::var("PAYSTACK_SECRET").expect("PAYSTACK_SECRET must be set"),
-            solana_program_id: env::var("SOLANA_PROGRAM_ID")
+            secret_key: env::var("PAYSTACK_SECRET").expect("PAYSTACK_SECRET must be set"),
+            program_id: env::var("SOLANA_PROGRAM_ID")
                 .expect("SOLANA_PROGRAM_ID must be set")
                 .parse()
                 .expect("Invalid program ID"),

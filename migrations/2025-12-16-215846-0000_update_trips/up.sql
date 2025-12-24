@@ -1,0 +1,2 @@
+ALTER TABLE trips
+   ADD COLUMN rider_email  TEXT NOT NULL DEFAULT '';
