@@ -8,7 +8,6 @@ use diesel::prelude::*;
 use diesel::pg::PgConnection;
 use uuid::Uuid;
 use tokio::time::{ Duration, sleep, timeout };
-use reqwest::Client;
 use std::collections::HashMap;
 use crate::db::{ DbPool };
 use crate::api::admin::{ Rider, NewRider };
@@ -17,8 +16,10 @@ use crate::services::pricing;
 use crate::services::notifications::calculate_eta;
 use crate::api::drivers::{ DriverResponse, DriverResponsePayloadOut, DriverInfo, Driver };
 
+
 lazy_static! {
     pub static ref DRIVER_RESPONSES: Mutex<HashMap<Uuid, oneshot::Sender<DriverResponse>>> = Mutex::new(HashMap::new());
+    pub static ref DRIVER_NOTIFY_CHANNELS: Mutex<HashMap<Uuid, oneshot::Sender<NewRideRequest>>> = Mutex::new(HashMap::new());
 }
 
 
@@ -36,7 +37,6 @@ pub async fn assign_driver_handler(
     let estimated_time_min = body.estimated_time_min;
     let estimated_arrival: String = calculate_eta(estimated_time_min);
 
-    //calculate price and estimated time based on ride type
     let ride_type2: RideType = serde_json::from_value(body.ride_type.clone())
                                          .expect("Failed to parse ride type");
 
@@ -45,15 +45,13 @@ pub async fn assign_driver_handler(
         RideType::ASAPEXPRESS => pricing::calculate_express(distance_km, estimated_time_min),
     };
 
-    
-     let cancel_reasons = vec![
+    let cancel_reasons = vec![
         "Change of plans".to_string(),
         "Driver taking too long".to_string(),
         "Found alternate transport".to_string(),
         "Incorrect destination".to_string(),
     ];
 
-    // Filter by ride type (maps to vehicle_type in DB)
     let vehicle_filter = match &ride_type2 {
         RideType::ASAP => vec!["EV".to_string()],
         RideType::ASAPEXPRESS => vec!["Bike".to_string()],
@@ -61,137 +59,112 @@ pub async fn assign_driver_handler(
 
     for _ in 1..=4 {
         let available_drivers = web::block({
-            
             let pool = pool.clone();
             let vehicle_filter = vehicle_filter.clone();
 
             move || {
+                let mut connection = match pool.get() {
+                    Ok(conn) => conn,
+                    Err(_) => return Err("Failed to get DB connection"),
+                };
 
-            let mut connection = match pool.get() {
-                                 Ok(conn) => conn,
-                                 Err(_) => return Err("Failed to get DB connection"),
-    };
-
-            drivers.filter(vehicle_type.eq_any(&vehicle_filter))
-                   .filter(status.eq("available")) //treat
-                   .limit(10)
-                   .select(Driver::as_select())
-                   .load::<Driver>(&mut connection)
-                   .map_err(|_| "DB query error")
-                }
-                
-            }).await;
+                drivers.filter(vehicle_type.eq_any(&vehicle_filter))
+                       .filter(status.eq("available"))
+                       .limit(10)
+                       .select(Driver::as_select())
+                       .load::<Driver>(&mut connection)
+                       .map_err(|_| "DB query error")
+            }
+        }).await;
 
         match available_drivers {
             Ok(Ok(list)) if !list.is_empty() => {
                 for driver in list {
+                    let driver_info: DriverInfo = DriverInfo {
+                        name: driver.name.clone(),
+                        phone: driver.phone.clone(),
+                        //rating: driver.rating,
+                        vehicle: driver.vehicle.clone(),
+                        license_number: driver.license_number.clone(),
+                    };
 
-                        let driver_info: DriverInfo = DriverInfo {
-                            name: driver.name.clone(),
-                            phone: driver.phone.clone(),
-                            //rating: driver.rating,
-                            vehicle: driver.vehicle.clone(),
-                            license_number: driver.license_number.clone(),
+                    let pick_up_geo: GeoPoint = serde_json::from_value(body.pick_up.clone())
+                        .expect("Failed to convert pick_up JSON to GeoPoint");
+
+                    if minimum_distance_between_driver_and_pickup(pick_up_geo, driver.location().clone()) {
+                        let (tx, rx) = oneshot::channel();
+                        DRIVER_RESPONSES.lock().await.insert(driver.driver_id, tx);
+
+                        // Send ride request directly to the driver's waiting long-poll connection
+                        let notified = if let Some(notify_tx) = DRIVER_NOTIFY_CHANNELS.lock().await.remove(&driver.driver_id) {
+                            notify_tx.send((*body).clone()).is_ok()
+                        } else {
+                            false
                         };
 
-
-                        let pick_up_geo: GeoPoint = serde_json::from_value(body.pick_up.clone())
-                                                                .expect("Failed to convert pick_up JSON to GeoPoint");
-
-                    if minimum_distance_between_driver_and_pickup(
-                        pick_up_geo,
-                        driver.location().clone(),
-                    ) {
-                        // ✅ Optional: mark driver as assigned
-                        // let _ = diesel::update(drivers.filter(id.eq(driver.id)))
-                        //     .set(status.eq("assigned"))
-                        //     .execute(&mut connection);
-
-                        // ✅ Send notification to driver app/server
-                    let (tx, rx) = oneshot::channel();
-                    DRIVER_RESPONSES.lock().await.insert(driver.driver_id, tx);
-
-                    // Notify driver
-                    let notify_url = format!("http://localhost:8080/notify-driver/{}", driver.driver_id);
-                    let client = reqwest::Client::new();
-                    let resp = client.post(&notify_url).json(&body).send().await.expect("Failed to send notification");
-
-                if resp.status().is_success() {
-                // Wait for that driver's response
-                    
-    match timeout(Duration::from_secs(50), rx).await {
-    Ok(Ok(other_driver_response)) => match other_driver_response {
-        DriverResponse::Accepted => {
-            let ride_assignment = RideAssignment {
-                estimated_price,
-                estimated_time_min,
-                estimated_arrival,
-                validation_status: "driver is on his way.".into(),
-                driver_assigned: Some(driver_info),
-                message: Some("your package will be with you shortly.".into()),
-                cancel_ride: Some(cancel_reasons),
-            };
-            println!("Driver {} accepted ride", driver.driver_id);
-            return HttpResponse::Ok().json(ride_assignment);
-        }
-        DriverResponse::Rejected => {
-            println!("Driver {} rejected ride", driver.driver_id);
-            continue;
-        }
-        DriverResponse::Timeout => {
-            println!("Driver {} did not respond", driver.driver_id);
-            continue;
-        }
-    },
-    Ok(Err(_recv_error)) => {
-        println!("Driver {} channel failed", driver.driver_id);
-        continue;
-    },
-    Err(_elapsed) => {
-        println!("Driver {} timed out", driver.driver_id);
-        continue;
-    },
-}
-
-                        
-                        
-             }
-
-        }
-    
-    }
-    
-}
-         Ok(Ok(_)) => {
+                        if notified {
+                            match timeout(Duration::from_secs(50), rx).await {
+                                Ok(Ok(other_driver_response)) => match other_driver_response {
+                                    DriverResponse::Accepted => {
+                                        let ride_assignment = RideAssignment {
+                                            estimated_price,
+                                            estimated_time_min,
+                                            estimated_arrival,
+                                            validation_status: "driver is on his way.".into(),
+                                            driver_assigned: Some(driver_info),
+                                            message: Some("your package will be with you shortly.".into()),
+                                            cancel_ride: Some(cancel_reasons),
+                                        };
+                                        println!("Driver {} accepted ride", driver.driver_id);
+                                        return HttpResponse::Ok().json(ride_assignment);
+                                    }
+                                    DriverResponse::Rejected => {
+                                        println!("Driver {} rejected ride", driver.driver_id);
+                                        continue;
+                                    }
+                                    DriverResponse::Timeout => {
+                                        println!("Driver {} did not respond", driver.driver_id);
+                                        continue;
+                                    }
+                                },
+                                Ok(Err(_recv_error)) => {
+                                    println!("Driver {} channel failed", driver.driver_id);
+                                    continue;
+                                },
+                                Err(_elapsed) => {
+                                    println!("Driver {} timed out", driver.driver_id);
+                                    continue;
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Ok(_)) => {
                 // no driver found, wait and retry
                 sleep(Duration::from_millis(500)).await;
             },
             Ok(Err(inner_err)) => eprintln!("Db error: {}", inner_err),
-            
             Err(e) => {
                 eprintln!("DB error: {}", e);
                 return HttpResponse::InternalServerError().body("Database query failed");
             },
+        }
     }
-}
 
     HttpResponse::NotFound().body("No suitable driver available after 4 attempts")
 }
 
 
-
-
-
-pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>, driver_id: web::Path<Uuid>) -> impl Responder {
+// Called by the driver app to submit their accept/reject — feeds assign_driver's oneshot channel
+pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>) -> impl Responder {
     let data = payload.into_inner();
-    let driver_id = driver_id.into_inner();
 
-    // Extract driver_id and response together
     let (driver_id, response) = match data {
         DriverResponsePayloadOut::Accepted {
-            rider_id: _rider_id, // keep if needed
+            rider_id: _rider_id,
             driver_id,
-            message: _message,   // keep if needed
+            message: _message,
         } => (driver_id, DriverResponse::Accepted),
 
         DriverResponsePayloadOut::Rejected {
@@ -199,7 +172,6 @@ pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>, drive
         } => (driver_id, DriverResponse::Rejected),
     };
 
-    // Use driver_id to look up the response channel
     if let Some(tx) = DRIVER_RESPONSES.lock().await.remove(&driver_id) {
         let _ = tx.send(response);
     }
@@ -208,10 +180,7 @@ pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>, drive
 }
 
 
-
-
-
- pub fn validate_rider_account(
+pub fn validate_rider_account(
     connection: &mut PgConnection,
     rider_id: Uuid
 ) -> Result<Rider, String> {
@@ -233,51 +202,34 @@ pub async fn request_ride(
     use crate::schema::ride_request::dsl::*;
 
     let req = body.into_inner();
-
     let rider_uuid = req.rider_id;
-
-
     let new_ride_request = NewRideRequest::new(req);
 
-
     let validation_status = web::block({
-    let pool = pool.clone();
-    move || {
-        let mut conn = pool.get().unwrap();
-        validate_rider_account(&mut conn, rider_uuid)
-            .map_err(|e| format!("rider validation error: {}", e))?;
+        let pool = pool.clone();
+        move || -> Result<usize, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            validate_rider_account(&mut conn, rider_uuid)
+                .map_err(|e| format!("rider validation error: {}", e))?;
 
-        diesel::insert_into(ride_request)
-            .values(new_ride_request)
-            .execute(&mut conn)
-            .map_err(|e| format!("DB insert error: {}", e))
+            diesel::insert_into(ride_request)
+                .values(new_ride_request)
+                .execute(&mut conn)
+                .map_err(|e| format!("DB insert error: {}", e))
+        }
+    }).await;
 
+    match validation_status {
+        Ok(Ok(status)) => HttpResponse::Ok().json(status),
+        Ok(Err(db_err)) => HttpResponse::InternalServerError().body(format!("DB error: {}", db_err)),
+        Err(block_err) => HttpResponse::InternalServerError().body(format!("Blocking error: {}", block_err)),
     }
-}).await;
-
-let status = match validation_status {
-    Ok(Ok(status)) => status,
-
-    Ok(Err(db_err)) => {
-        return HttpResponse::InternalServerError()
-            .body(format!("DB error: {}", db_err));
-    }
-
-    Err(block_err) => {
-        return HttpResponse::InternalServerError()
-            .body(format!("Blocking error: {}", block_err));
-    }
-};
-
-HttpResponse::Ok().json(status)
-
-
 }
 
 pub fn routes() -> Scope {
     web::scope("/riders")
         .route("/assign-driver", web::get().to(assign_driver_handler))
-        .route("/wait-driver-response", web::get().to(driver_response))
+        .route("/wait-driver-response", web::post().to(driver_response))
         .route("/ride-request", web::post().to(request_ride))
 }
 
@@ -297,6 +249,10 @@ pub struct CreateRideRequest {
     pub ride_type: RideType,
     pub payment_method: String,
     pub items: Vec<ItemDetails>,
+    pub order_id: Option<Uuid>, //from zazu
+    pub user_id: Option<i64>,
+    pub user_phone_number: Option<String>,
+    pub vendor_phone_number: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Insertable, Clone)]
@@ -312,15 +268,17 @@ pub struct NewRideRequest {
     pub ride_type: serde_json::Value,
     pub items: serde_json::Value,
     pub payment_method: String,
+    pub order_id: Option<Uuid>, //from zazu
+    pub user_id: Option<i64>,
+    pub user_phone_number: Option<String>,
+    pub vendor_phone_number: Option<String>,
 }
 
 
 impl NewRideRequest {
     pub fn new(req: CreateRideRequest) -> Self {
-
         let distance_km = distance_between(&req.pick_up, &req.drop_off);
-        let estimated_time_min =
-            pricing::estimated_time_min(distance_km, &req.ride_type);
+        let estimated_time_min = pricing::estimated_time_min(distance_km, &req.ride_type);
 
         let estimated_price = match req.ride_type {
             RideType::ASAP => pricing::calculate_asap(distance_km, estimated_time_min),
@@ -338,6 +296,10 @@ impl NewRideRequest {
             distance_km,
             estimated_time_min,
             payment_method: req.payment_method,
+            order_id: req.order_id,
+            user_id: req.user_id,
+            user_phone_number: req.user_phone_number,
+            vendor_phone_number: req.vendor_phone_number,
         }
     }
 }
@@ -360,8 +322,11 @@ pub struct RideRequest {
     pub ride_type: serde_json::Value,
     pub items: serde_json::Value,
     pub payment_method: String,
+    pub order_id: Option<Uuid>, //from zazu
+    pub user_id: Option<i64>,
+    pub user_phone_number: Option<String>,
+    pub vendor_phone_number: Option<String>,
 }
-
 
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -371,7 +336,7 @@ pub struct RideAssignment {
     pub estimated_price: i64,
     pub validation_status: String,
     pub driver_assigned: Option<DriverInfo>,
-    pub message: Option<String>, 
+    pub message: Option<String>,
     pub cancel_ride: Option<Vec<String>>,
 }
 
@@ -382,41 +347,31 @@ pub struct ItemDetails {
     pub dimensions: (f64, f64, f64), // (length, width, height) in cm
     pub quantity: u32,
     pub weight: f64, // in kg
-    
 }
 
 impl ItemDetails {
     pub fn max_dimensions(&self) -> Result<(), String> {
         let (length, width, height) = self.dimensions;
-        
-
-        if (length, width, height) > (13.0, 13.0, 13.0)  {
+        if (length, width, height) > (13.0, 13.0, 13.0) {
             return Err("Sorry, we cant handle items of this size.".into());
         }
-            Ok(())
-    } 
+        Ok(())
+    }
 
     pub fn aggregate_quantity(&self) -> Result<(), String> {
-            let mut total_number_of_items = self.quantity;
-            let max_number_of_items = 10;
-
-            if total_number_of_items > max_number_of_items {
-                return Err("Too many Items".into());
-            }
-
-            Ok(())
+        let total_number_of_items = self.quantity;
+        let max_number_of_items = 10;
+        if total_number_of_items > max_number_of_items {
+            return Err("Too many Items".into());
         }
+        Ok(())
+    }
 
     pub fn max_weight(&self) -> Result<(), String> {
-         let total_weight = self.weight * self.quantity as f64;
-        
-         if total_weight > 5.0 {
+        let total_weight = self.weight * self.quantity as f64;
+        if total_weight > 5.0 {
             return Err("Sorry, we cant handle items of this size.".into());
         }
-
         Ok(())
-   }
-
-
+    }
 }
-

@@ -25,7 +25,7 @@ use std::env;
 }
 
 
-fn i64_to_u64(v: i64) -> Result<u64> {
+pub fn i64_to_u64(v: i64) -> Result<u64> {
     if v < 0 {
         Err(anyhow!("negative value cannot convert to u64"))
     } else {
@@ -33,7 +33,7 @@ fn i64_to_u64(v: i64) -> Result<u64> {
     }
 }
 
-fn vec_to_array_32(v: Vec<u8>) -> Result<[u8; 32]> {
+pub fn vec_to_array_32(v: Vec<u8>) -> Result<[u8; 32]> {
     if v.len() != 32 {
         return Err(anyhow!("expected 32 bytes, got {}", v.len()));
     }
@@ -136,7 +136,7 @@ pub async fn handle_payment_confirmation(
         Err(_) => return HttpResponse::BadRequest().body("Invalid end_ts"),
     },
     None => return HttpResponse::BadRequest().body("end_ts is required"),
-};
+    };
 
 
     let fare_lamports_program = match trip

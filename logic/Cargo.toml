@@ -31,7 +31,7 @@ chrono = "0.4"                                # For timestamps
 # Solana interaction (while backend talks to Solana RPC)
 ride_program = { path = "../programs/ride_program" }
 anchor-client = "0.32.1"
-solana-program = "2.0.25"
+solana-program = "2.3.0"
 solana-client = "2.0.25"
 solana-sdk = "2.0.25"
 dotenv = "0.15.0"

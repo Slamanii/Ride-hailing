@@ -1,11 +1,10 @@
-use actix_web::{ get, post, web, Scope, HttpResponse,  };
+use actix_web::{ web, Scope, HttpResponse,  };
 use serde::{ Deserialize, Serialize };
-use serde_json::json;
 use diesel::prelude::*;
+use serde_json::Value;
 use crate::db::{ DbPool };
 use crate::services::pricing::{ GeoPoint };
 use uuid::Uuid;
-use solana_sdk::pubkey::Pubkey;
 use crate::api::drivers::{ Driver, DriverResponse };
 
 pub async fn admin_dashboard(pool: web::Data<DbPool>) -> HttpResponse {
@@ -13,32 +12,28 @@ pub async fn admin_dashboard(pool: web::Data<DbPool>) -> HttpResponse {
     use crate::schema::drivers::dsl::*;
 
     // Count riders
-    let rider_count_result: Result<i64, _> = web::block({
+    let rider_count = match web::block({
         let pool = pool.clone();
-        move || {
-            let mut conn = pool.get().expect("Failed to get DB connection");
-            riders.count()
-                  .get_result(&mut conn)
+        move || -> Result<i64, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            riders.count().get_result(&mut conn).map_err(|e| e.to_string())
         }
-    }).await.expect("Failed to await rider count");
-
-    let rider_count = match rider_count_result {
-        Ok(count) => count,
+    }).await {
+        Ok(Ok(count)) => count,
+        Ok(Err(e)) => return HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
         Err(_) => return HttpResponse::InternalServerError().body("Error counting riders"),
     };
 
     // Count drivers
-    let driver_count_result: Result<i64, _> = web::block({
+    let driver_count = match web::block({
         let pool = pool.clone();
-        move || {
-            let mut conn = pool.get().expect("Failed to get DB connection");
-            drivers.count()
-                   .get_result(&mut conn)
+        move || -> Result<i64, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            drivers.count().get_result(&mut conn).map_err(|e| e.to_string())
         }
-    }).await.expect("Failed to await driver count");
-
-    let driver_count = match driver_count_result {
-        Ok(count) => count,
+    }).await {
+        Ok(Ok(count)) => count,
+        Ok(Err(e)) => return HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
         Err(_) => return HttpResponse::InternalServerError().body("Error counting drivers"),
     };
 
@@ -60,22 +55,20 @@ pub async fn create_rider(
     let new_rider = NewRider::new(body.into_inner());
 
     let result = web::block({
-
         let pool = pool.clone();
-        
-        move || {
-        let mut conn = pool.get().expect("Failed to get DB");
-            
-        diesel::insert_into(riders)
+        move || -> Result<usize, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            diesel::insert_into(riders)
                 .values(new_rider)
                 .execute(&mut conn)
-    
-            }
-        }).await;
-            
-            match result {
-                Ok(_) => HttpResponse::Ok().json("Driver created"),
-                Err(err) => HttpResponse::InternalServerError().body(format!("DB Error: {:?}", err)),
+                .map_err(|e| e.to_string())
+        }
+    }).await;
+
+    match result {
+        Ok(Ok(_rows)) => HttpResponse::Ok().json("Rider created"),
+        Ok(Err(db_err)) => HttpResponse::BadRequest().body(format!("DB error: {}", db_err)),
+        Err(block_err) => HttpResponse::InternalServerError().body(format!("Threadpool error: {}", block_err)),
     }
 }
 
@@ -83,35 +76,27 @@ pub async fn get_riders(pool: web::Data<DbPool>) -> HttpResponse {
     use crate::schema::riders::dsl::*;
 
     let results = web::block({
-        
         let pool = pool.clone();
-        move || {
-
-        let mut connection = pool.get().expect("Failed to get DB connection");
-
-        riders.limit(20)
-              .select(Rider::as_select())
-              .load::<Rider>(&mut connection)
+        move || -> Result<Vec<Rider>, String> {
+            let mut connection = pool.get().map_err(|e| e.to_string())?;
+            riders.limit(20)
+                  .select(Rider::as_select())
+                  .load::<Rider>(&mut connection)
+                  .map_err(|e| e.to_string())
         }
     }).await;
 
-     match results {
-    Ok(Ok(data)) => HttpResponse::Ok().json(data),
-
-    Ok(Err(db_err)) => {
-        eprintln!("DB error: {:?}", db_err);
-        HttpResponse::InternalServerError()
-            .body("Database error")
+    match results {
+        Ok(Ok(data)) => HttpResponse::Ok().json(data),
+        Ok(Err(db_err)) => {
+            eprintln!("DB error: {:?}", db_err);
+            HttpResponse::InternalServerError().body("Database error")
+        }
+        Err(blocking_err) => {
+            eprintln!("Blocking error: {:?}", blocking_err);
+            HttpResponse::InternalServerError().body("Server busy")
+        }
     }
-
-    Err(blocking_err) => {
-        eprintln!("Blocking error: {:?}", blocking_err);
-        HttpResponse::InternalServerError()
-            .body("Server busy")
-    }
-
-  }
-
 }
 
 
@@ -124,21 +109,20 @@ pub async fn create_driver(
     let new_driver = NewDriver::new(body.into_inner());
 
     let result = web::block({
-        
         let pool = pool.clone();
-        
-        move || {
-        let mut conn = pool.get().expect("Failed to get DB");
-
-        diesel::insert_into(drivers)
-            .values(new_driver)
-            .execute(&mut conn)
+        move || -> Result<usize, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            diesel::insert_into(drivers)
+                .values(new_driver)
+                .execute(&mut conn)
+                .map_err(|e| e.to_string())
         }
     }).await;
 
     match result {
-        Ok(_) => HttpResponse::Ok().json("Driver created"),
-        Err(err) => HttpResponse::InternalServerError().body(format!("DB Error: {:?}", err)),
+        Ok(Ok(_rows)) => HttpResponse::Ok().json("Driver created"),
+        Ok(Err(db_err)) => HttpResponse::BadRequest().body(format!("DB error: {}", db_err)),
+        Err(block_err) => HttpResponse::InternalServerError().body(format!("Threadpool error: {}", block_err)),
     }
 }
 
@@ -147,35 +131,27 @@ pub async fn get_drivers(pool: web::Data<DbPool>) -> HttpResponse {
     use crate::schema::drivers::dsl::*;
 
     let results = web::block({
-
         let pool = pool.clone();
-        
-        move || {
-        
-        let mut connection = pool.get().expect("Failed to get DB connection");
-
-        drivers.limit(20)
-                .select(Driver::as_select())
-                .load::<Driver>(&mut connection)
+        move || -> Result<Vec<Driver>, String> {
+            let mut connection = pool.get().map_err(|e| e.to_string())?;
+            drivers.limit(20)
+                   .select(Driver::as_select())
+                   .load::<Driver>(&mut connection)
+                   .map_err(|e| e.to_string())
         }
     }).await;
 
-        match results {
-    Ok(Ok(data)) => HttpResponse::Ok().json(data),
-
-    Ok(Err(db_err)) => {
-        eprintln!("DB error: {:?}", db_err);
-        HttpResponse::InternalServerError()
-            .body("Database error")
+    match results {
+        Ok(Ok(data)) => HttpResponse::Ok().json(data),
+        Ok(Err(db_err)) => {
+            eprintln!("DB error: {:?}", db_err);
+            HttpResponse::InternalServerError().body("Database error")
+        }
+        Err(blocking_err) => {
+            eprintln!("Blocking error: {:?}", blocking_err);
+            HttpResponse::InternalServerError().body("Server busy")
+        }
     }
-
-    Err(blocking_err) => {
-        eprintln!("Blocking error: {:?}", blocking_err);
-        HttpResponse::InternalServerError()
-            .body("Server busy")
-    }
-}
-
 }
 
 //what admin::routes() returns
@@ -194,6 +170,7 @@ pub struct RiderRequest {
     pub name: String,
     pub email: String,
     pub phone: String,
+    pub rider_pubkey: String,
 }
 
 #[derive(Queryable, Serialize, Deserialize, Selectable, Clone)]
@@ -201,6 +178,7 @@ pub struct RiderRequest {
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Rider {
     pub rider_id: Uuid,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
     pub rider_pubkey: serde_json::Value,
     pub name: String,
     pub email: String,
@@ -221,7 +199,7 @@ impl NewRider {
     pub fn new(req: RiderRequest) -> Self {
         Self {
             rider_id: Uuid::new_v4(),
-            rider_pubkey: serde_json::to_value(Pubkey::new_unique().to_string()).expect("serialize pubkey"),
+            rider_pubkey: serde_json::to_value(&req.rider_pubkey).expect("serialize pubkey"),
             name: req.name,
             email: req.email,
             phone: req.phone,
@@ -235,10 +213,10 @@ pub struct DriverRequest {
     pub name: String,
     pub email: String,
     pub phone: String,
+    pub driver_pubkey: String,
     pub license_number: Option<String>,
     pub vehicle_type: String,
     pub vehicle: Option<String>,
-
 }
 
 
@@ -259,11 +237,12 @@ pub struct NewDriver {
     pub vehicle: Option<String>,
 }
 
+
 impl NewDriver {
     pub fn new(req: DriverRequest) -> Self {
         Self {
             driver_id: Uuid::new_v4(),
-            driver_pubkey: serde_json::to_value(Pubkey::new_unique().to_string()).expect("serialize pubkey"),
+            driver_pubkey: serde_json::to_value(&req.driver_pubkey).expect("serialize pubkey"),
             name: req.name,
             email: req.email,
             phone: req.phone,

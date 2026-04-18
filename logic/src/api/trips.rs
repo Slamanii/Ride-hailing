@@ -17,7 +17,7 @@ use diesel::pg::PgConnection;
 
 pub async fn create_trip(
     pool: web::Data<DbPool>,
-    body: web::Json<Trip>
+    body: web::Json<CreateTripInput>
 ) -> HttpResponse {
     
     let trip = body.into_inner();
@@ -29,15 +29,11 @@ pub async fn create_trip(
 
             let mut conn = pool.get().expect("Failed to get connection");
 
-            let mut hasher = Sha256::new();
-            hasher.update(Uuid::new_v4().as_bytes());
-
-            let trip_id_bytes: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
-        
+    
 
         diesel::insert_into(trips)
             .values((
-                trip_id.eq(trip_id_bytes), // [u8; 32] as bytes
+                trip_id.eq(trip.trip_id), // [u8; 32] as bytes
                 rider_id.eq(trip.rider_id), // UUID
                 reference.eq(trip.reference),
                 status.eq("ongoing"),
@@ -164,19 +160,11 @@ pub fn get_trip_by_reference(conn: &mut PgConnection, ref_str: &str) -> QueryRes
 
 
 // from escrow .rs or to escrow.rs
-#[derive(Deserialize)]
-struct CreateTripInput {
-    pickup: String,
-    destination: String,
-    fare_estimate: i64,
-    rider_id: Uuid,
-}
 
-
-#[derive(Serialize, Deserialize, Queryable, Selectable, Debug, Clone)]
+#[derive(Insertable, Deserialize, Clone)]
 #[diesel(table_name = crate::schema::trips)]
-pub struct Trip {
-    pub trip_id: Vec<u8>,
+struct CreateTripInput {
+    pub trip_id: [u8; 32],
     pub rider_id: Uuid,
     pub reference: String,
     pub pick_up: String,
@@ -196,16 +184,20 @@ pub struct Trip {
 }
 //you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
-impl Trip {
+impl CreateTripInput {
 
     pub fn new(drv: Driver, rdr: Rider, req2: RideRequest) -> Self {
         
         let start_ts_value = Utc::now().timestamp() as i64;
+        let mut hasher = Sha256::new();
+            hasher.update(Uuid::new_v4().as_bytes());
+
+            let trip_id_bytes: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
 
        
 
         Self {
-            trip_id: Vec::new(),  //this should be a UUID in bytes
+            trip_id: trip_id_bytes,
             rider_id: rdr.rider_id,
             reference: Uuid::new_v4().to_string(),
             pick_up: req2.pick_up.to_string(),
@@ -226,6 +218,35 @@ impl Trip {
 
         }
     }
+}
+
+
+#[derive(Serialize, Deserialize, Queryable, Selectable, Debug, Clone)]
+#[diesel(table_name = crate::schema::trips)]
+pub struct Trip {
+    pub trip_id: Vec<u8>,
+    pub rider_id: Uuid,
+    pub reference: String,
+    pub pick_up: String,
+    pub drop_off: String,
+    pub driver_location: String,
+    pub rider_pubkey: String,
+    pub driver_pubkey: String,
+    pub driver_id: Uuid,
+    pub status: String,
+    pub start_ts: i64,
+    pub end_ts: Option<i64>,
+    pub distance_km: f64,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub item: serde_json::Value,  //treat in sql
+    pub fare_estimate: Option<i64>,
+    pub fare_lamports: Option<i64>,
+    pub rider_email: String,
+}
+//you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
+
+impl Trip {
+
 
     pub fn update_status(&mut self)  {
         

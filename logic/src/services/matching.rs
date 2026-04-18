@@ -25,23 +25,23 @@ pub async fn process_geolocation(
         
         let pool = pool.clone();
         
-        move || {
-        let mut conn = pool.get().expect("Failed to get DB connection from pool");
-        match kind {
-            GeoPointKind::DriverLocation => {
-                update_driver_location(&mut conn, id, &gp)
-                    .map_err(|e| format!("{:?}", e))
-            }
-            GeoPointKind::PickUp => {
-                update_request_pickup(&mut conn, id, &gp)
-                    .map_err(|e| format!("{:?}", e))
-            }
-            GeoPointKind::DropOff => {
-                update_request_dropoff(&mut conn, id, &gp)
-                    .map_err(|e| format!("{:?}", e))
+        move || -> Result<usize, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            match kind {
+                GeoPointKind::DriverLocation => {
+                    update_driver_location(&mut conn, id, &gp)
+                        .map_err(|e| format!("{:?}", e))
+                }
+                GeoPointKind::PickUp => {
+                    update_request_pickup(&mut conn, id, &gp)
+                        .map_err(|e| format!("{:?}", e))
+                }
+                GeoPointKind::DropOff => {
+                    update_request_dropoff(&mut conn, id, &gp)
+                        .map_err(|e| format!("{:?}", e))
+                }
             }
         }
-                }
 
     })
     .await;
@@ -142,5 +142,5 @@ pub struct RideRequestUpdateDropOffLocation {
 
 pub fn routes() -> Scope {
     web::scope("/matching")
-        .route("/process-geolocation", web::post().to(process_geolocation))
+        .route("/process-geolocation/{id}", web::post().to(process_geolocation))
 }

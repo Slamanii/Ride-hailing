@@ -1,1 +1,2 @@
--- This file should undo anything in `up.sql`
+ALTER TABLE trips
+    DROP COLUMN rider_email;

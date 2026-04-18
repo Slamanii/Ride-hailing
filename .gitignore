@@ -2,4 +2,6 @@ node_modules
 node_modules
 target/
 /web/
-/mobile/
+/mobile/.DS_Store
+.env
+exclude.txt
