@@ -18,7 +18,7 @@ pub async fn process_geolocation(
     payload: web::Json<GeoPointRequest>,
 ) -> HttpResponse {
     let id = path.into_inner();
-    let gp = GeoPoint::new(payload.lng, payload.lat, payload.name.clone());
+    let gp = GeoPoint::new(payload.lat, payload.lng, payload.name.clone());
     let kind = payload.kind.clone();
 
     let result = web::block({
