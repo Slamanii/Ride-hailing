@@ -60,7 +60,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    drivers (driver_id) {
+    back_drivers (driver_id) {
         driver_id -> Uuid,
         driver_pubkey -> Jsonb,
         name -> Text,
@@ -107,7 +107,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    ride_request (request_id) {
+    back_ride_request (request_id) {
         request_id -> Uuid,
         rider_id -> Uuid,
         pick_up -> Jsonb,
@@ -126,7 +126,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    riders (rider_id) {
+    back_custom_users (rider_id) {
         rider_id -> Uuid,
         rider_pubkey -> Jsonb,
         name -> Text,
@@ -161,7 +161,7 @@ diesel::table! {
 }
 
 diesel::table! {
-    trips (trip_id) {
+    back_trips (trip_id) {
         trip_id -> Bytea,
         rider_id -> Uuid,
         reference -> Text,
@@ -187,13 +187,13 @@ diesel::joinable!(messages -> delivery_orders (delivery_order_id));
 diesel::allow_tables_to_appear_in_same_query!(
     custom_users,
     delivery_orders,
-    drivers,
+    back_drivers,
     locations,
     messages,
     package_images,
-    ride_request,
-    riders,
+    back_ride_request,
+    back_custom_users,
     riders_current_status,
     saved_locations,
-    trips,
+    back_trips,
 );

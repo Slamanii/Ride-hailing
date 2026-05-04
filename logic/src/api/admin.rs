@@ -8,8 +8,8 @@ use uuid::Uuid;
 use crate::api::drivers::{ Driver, DriverResponse };
 
 pub async fn admin_dashboard(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::riders::dsl::*;
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     // Count riders
     let rider_count = match web::block({
@@ -50,7 +50,7 @@ pub async fn create_rider(
     pool: web::Data<DbPool>,
     body: web::Json<RiderRequest>,
 ) -> HttpResponse {
-    use crate::schema::riders::dsl::*;
+    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
 
     let new_rider = NewRider::new(body.into_inner());
 
@@ -73,7 +73,7 @@ pub async fn create_rider(
 }
 
 pub async fn get_riders(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::riders::dsl::*;
+    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
 
     let results = web::block({
         let pool = pool.clone();
@@ -104,7 +104,7 @@ pub async fn create_driver(
     pool: web::Data<DbPool>,
     body: web::Json<DriverRequest>,
 ) -> HttpResponse {
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     let new_driver = NewDriver::new(body.into_inner());
 
@@ -128,7 +128,7 @@ pub async fn create_driver(
 
 
 pub async fn get_drivers(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     let results = web::block({
         let pool = pool.clone();
@@ -174,7 +174,7 @@ pub struct RiderRequest {
 }
 
 #[derive(Queryable, Serialize, Deserialize, Selectable, Clone)]
-#[diesel(table_name = crate::schema::riders)]
+#[diesel(table_name = crate::schema::back_custom_users)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Rider {
     pub rider_id: Uuid,
@@ -186,7 +186,7 @@ pub struct Rider {
 }
 
 #[derive(Insertable, Deserialize)]
-#[diesel(table_name = crate::schema::riders)]
+#[diesel(table_name = crate::schema::back_custom_users)]
 pub struct NewRider {
     pub rider_id: Uuid,
     pub rider_pubkey: serde_json::Value,
@@ -222,7 +222,7 @@ pub struct DriverRequest {
 
 
 #[derive(Insertable, Deserialize, Clone)]
-#[diesel(table_name = crate::schema::drivers)]
+#[diesel(table_name = crate::schema::back_drivers)]
 pub struct NewDriver {
     pub driver_id: Uuid,
     pub driver_pubkey: serde_json::Value,

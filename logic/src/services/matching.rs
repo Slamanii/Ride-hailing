@@ -6,7 +6,8 @@ use uuid::Uuid;
 use serde_json::Value;
 use serde::{ Deserialize, Serialize };
 use crate::services::pricing::GeoPoint;
-use crate::schema::{ drivers::dsl::*, ride_request::dsl::* };
+use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
+use crate::schema::back_ride_request::dsl::{back_ride_request as ride_request, *};
 use crate::db::DbPool;
 
 
@@ -118,14 +119,14 @@ pub enum GeoPointKind {
 }
 
 #[derive(AsChangeset)]
-#[diesel(table_name = crate::schema::drivers)]
+#[diesel(table_name = crate::schema::back_drivers)]
 pub struct DriverUpdateLocation {
     #[diesel(sql_type = Jsonb)]
     pub driver_location: serde_json::Value,
 }
 
 #[derive(AsChangeset)]
-#[diesel(table_name = crate::schema::ride_request)]
+#[diesel(table_name = crate::schema::back_ride_request)]
 pub struct RideRequestUpdateLocation {
     #[diesel(sql_type = Jsonb)]
     pub pick_up: serde_json::Value
@@ -133,7 +134,7 @@ pub struct RideRequestUpdateLocation {
 }
 
 #[derive(AsChangeset)]
-#[diesel(table_name = crate::schema::ride_request)]
+#[diesel(table_name = crate::schema::back_ride_request)]
 pub struct RideRequestUpdateDropOffLocation {
     #[diesel(sql_type = Jsonb)]
     pub drop_off: serde_json::Value

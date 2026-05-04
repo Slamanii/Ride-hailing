@@ -16,7 +16,7 @@ use ride_program::RideInput;
 use anchor_client::anchor_lang::{ InstructionData, ToAccountMetas };
 use crate::{ api::{ riders, drivers }, db::{ DbPool } };
 use crate::api::trips::get_trip_by_reference;
-use crate::schema::trips::dsl::*;
+use crate::schema::back_trips::dsl::{back_trips as trips, *};
 use std::env;
 
 

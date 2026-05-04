@@ -18,7 +18,7 @@ pub async fn update_driver(
     pool: web::Data<DbPool>,
     body: web::Json<Driver>,
 ) -> HttpResponse {
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     let driver = body.into_inner();
 
@@ -52,7 +52,7 @@ pub async fn update_driver(
 
 
 pub fn verify_driver_account(connection: &mut PgConnection, driver_id: Uuid) -> Result<Driver, String> {
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     let driver: Driver = drivers
         .find(&driver_id)
@@ -100,7 +100,7 @@ pub async fn notify_driver_handler(
 }
 
 pub fn get_ongoing_trips_count(connection: &mut PgConnection, driver_uuid: Uuid) -> Result<i64, String> {
-    use crate::schema::trips::dsl::*;
+    use crate::schema::back_trips::dsl::{back_trips as trips, *};
 
     let count: i64 = trips
         .filter(driver_id.eq(&driver_uuid))
@@ -119,9 +119,10 @@ pub async fn driver_response_handler(
     let payloads = payload.into_inner();
     let driver_response = payloads.response.clone();
     let rider_id = payloads.rider_id;
+    let input_driver_id = payloads.driver_id;
 
     let result = web::block({
-        let driver_id = payloads.driver_id;
+        let driver_id = input_driver_id;
         let pool = pool.clone();
 
         move || -> Result<DriverContext, String> {
@@ -160,13 +161,13 @@ pub async fn driver_response_handler(
         "accepted" => HttpResponse::Ok().json(
             DriverResponsePayloadOut::Accepted {
                 rider_id,
-                driver_id: ctx.driver.driver_id,
+                driver_id: input_driver_id,
                 message: "Ride confirmed".to_string(),
             },
         ),
         "rejected" => HttpResponse::Ok().json(
             DriverResponsePayloadOut::Rejected {
-                driver_id: ctx.driver.driver_id,
+                driver_id: input_driver_id,
             },
         ),
         _ => HttpResponse::BadRequest().body("Invalid response"),
@@ -178,7 +179,7 @@ pub async fn preflight_check(
     req: web::Json<RidePreflightRequest>,
 ) -> HttpResponse {
 
-    use crate::schema::drivers::dsl::*;
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     const MIN_DRIVERS_REQUIRED: usize = 3;
     const MAX_RETRIES: usize = 4;
@@ -335,7 +336,7 @@ pub struct RidePreflightResponse {
 }
 
 #[derive(Debug, Queryable, Serialize, Deserialize, Selectable, Clone)]
-#[diesel(table_name = crate::schema::drivers)]
+#[diesel(table_name = crate::schema::back_drivers)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct Driver {
     pub driver_id: Uuid,
@@ -375,7 +376,7 @@ impl Driver {
 }
 
 #[derive(AsChangeset)]
-#[diesel(table_name = crate::schema::drivers)]
+#[diesel(table_name = crate::schema::back_drivers)]
 pub struct DriverUpdate {
     pub driver_location: serde_json::Value,
     pub driver_response: serde_json::Value,

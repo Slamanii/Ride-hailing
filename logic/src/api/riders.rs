@@ -27,8 +27,12 @@ pub async fn assign_driver_handler(
     body: web::Json<NewRideRequest>,
     pool: web::Data<DbPool>,
 ) -> HttpResponse {
+    run_assign_driver(pool, body.into_inner()).await
+}
 
-    use crate::schema::drivers::dsl::*;
+pub async fn run_assign_driver(pool: web::Data<DbPool>, body: NewRideRequest) -> HttpResponse {
+
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
     let pick_up_geo2: GeoPoint = serde_json::from_value(body.pick_up.clone()).expect("Failed to convert pick_up JSON to GeoPoint");
     let drop_off_geo2: GeoPoint = serde_json::from_value(body.drop_off.clone()).expect("Failed to convert drop_off JSON to GeoPoint");
@@ -97,7 +101,7 @@ pub async fn assign_driver_handler(
 
                         // Send ride request directly to the driver's waiting long-poll connection
                         let notified = if let Some(notify_tx) = DRIVER_NOTIFY_CHANNELS.lock().await.remove(&driver.driver_id) {
-                            notify_tx.send((*body).clone()).is_ok()
+                            notify_tx.send(body.clone()).is_ok()
                         } else {
                             false
                         };
@@ -184,7 +188,7 @@ pub fn validate_rider_account(
     connection: &mut PgConnection,
     rider_id: Uuid
 ) -> Result<Rider, String> {
-    use crate::schema::riders::dsl::*;
+    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
 
     let rider: Rider = riders
         .find(rider_id)
@@ -199,13 +203,16 @@ pub async fn request_ride(
     pool: web::Data<DbPool>,
     body: web::Json<CreateRideRequest>,
 ) -> HttpResponse {
-    use crate::schema::ride_request::dsl::*;
+    use crate::schema::back_ride_request::dsl::{back_ride_request as ride_request, *};
 
     let req = body.into_inner();
     let rider_uuid = req.rider_id;
     let new_ride_request = NewRideRequest::new(req);
 
-    let validation_status = web::block({
+    let assignment_request = new_ride_request.clone();
+    let assignment_pool = pool.clone();
+
+    let result = web::block({
         let pool = pool.clone();
         move || -> Result<usize, String> {
             let mut conn = pool.get().map_err(|e| e.to_string())?;
@@ -219,8 +226,8 @@ pub async fn request_ride(
         }
     }).await;
 
-    match validation_status {
-        Ok(Ok(status)) => HttpResponse::Ok().json(status),
+    match result {
+        Ok(Ok(_)) => run_assign_driver(assignment_pool, assignment_request).await,
         Ok(Err(db_err)) => HttpResponse::InternalServerError().body(format!("DB error: {}", db_err)),
         Err(block_err) => HttpResponse::InternalServerError().body(format!("Blocking error: {}", block_err)),
     }
@@ -256,7 +263,7 @@ pub struct CreateRideRequest {
 }
 
 #[derive(Deserialize, Serialize, Insertable, Clone)]
-#[diesel(table_name = crate::schema::ride_request)]
+#[diesel(table_name = crate::schema::back_ride_request)]
 pub struct NewRideRequest {
     pub request_id: Uuid,
     pub rider_id: Uuid,
@@ -306,7 +313,7 @@ impl NewRideRequest {
 
 
 #[derive(Serialize, Deserialize, Clone, Queryable, Selectable)]
-#[diesel(table_name = crate::schema::ride_request)]
+#[diesel(table_name = crate::schema::back_ride_request)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 pub struct RideRequest {
     pub request_id: Uuid,

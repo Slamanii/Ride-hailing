@@ -5,7 +5,7 @@ use uuid::Uuid;
 use diesel::prelude::*;
 use chrono::Utc;
 use sha2::{Sha256, Digest};
-use crate::schema::trips::dsl::*;
+use crate::schema::back_trips::dsl::{back_trips as trips, *};
 use crate::api::drivers::Driver;
 use crate::api::riders::{ RideRequest };
 use crate::api::admin::Rider;
@@ -70,7 +70,7 @@ pub async fn update_trip(
     rider_uuid: web::Path<Uuid>,
     body: web::Json<Trip>,
 ) -> HttpResponse {
-    use crate::schema::trips::dsl::*;
+    use crate::schema::back_trips::dsl::{back_trips as trips, *};
 
     let rider_id_val = rider_uuid.into_inner();
     let trip = body.into_inner();
@@ -147,7 +147,7 @@ pub async fn get_trip(
 
 // in riders.rs
 pub fn get_trip_by_reference(conn: &mut PgConnection, ref_str: &str) -> QueryResult<Trip> {
-    use crate::schema::trips::dsl::*;
+    use crate::schema::back_trips::dsl::{back_trips as trips, *};
 
 
     trips.filter(reference.eq(ref_str))
@@ -162,7 +162,7 @@ pub fn get_trip_by_reference(conn: &mut PgConnection, ref_str: &str) -> QueryRes
 // from escrow .rs or to escrow.rs
 
 #[derive(Insertable, Deserialize, Clone)]
-#[diesel(table_name = crate::schema::trips)]
+#[diesel(table_name = crate::schema::back_trips)]
 struct CreateTripInput {
     pub trip_id: [u8; 32],
     pub rider_id: Uuid,
@@ -222,7 +222,7 @@ impl CreateTripInput {
 
 
 #[derive(Serialize, Deserialize, Queryable, Selectable, Debug, Clone)]
-#[diesel(table_name = crate::schema::trips)]
+#[diesel(table_name = crate::schema::back_trips)]
 pub struct Trip {
     pub trip_id: Vec<u8>,
     pub rider_id: Uuid,

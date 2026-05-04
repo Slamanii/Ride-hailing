@@ -3,7 +3,6 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use crate::db::DbPool;
-use crate::schema::trips::dsl::*;
 use crate::api::trips;
 use diesel::prelude::*;
 use std::env;
