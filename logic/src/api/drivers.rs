@@ -1,20 +1,30 @@
-use actix_web::{  web, Scope, HttpResponse };
+use actix_web::{ web, Scope, HttpResponse, HttpRequest };
 use serde::{ Serialize, Deserialize };
 use diesel::prelude::*;
 use diesel::sql_types::Jsonb;
 use uuid::Uuid;
-use serde_json::to_string;
 use serde_json::Value;
 use crate::db::{ DbPool };
 use diesel::pg::PgConnection;
 use crate::api::riders::{ NewRideRequest, RideType, DRIVER_NOTIFY_CHANNELS };
 use crate::services::{ pricing::{GeoPoint, distance_between, minimum_distance_between_driver_and_pickup}, escrow };
-use tokio::sync::oneshot;
+use crate::services::auth::AuthGuard;
+use tokio::sync::{ oneshot, Mutex as TokioMutex };
 use tokio::time::sleep;
 use std::time::Duration;
+use std::env;
+use reqwest::Client;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    pub static ref ZAZU_URL: TokioMutex<String> = TokioMutex::new(
+        env::var("ZAZU_URL").unwrap_or_default()
+    );
+}
 
 
 pub async fn update_driver(
+    _auth: AuthGuard,
     pool: web::Data<DbPool>,
     body: web::Json<Driver>,
 ) -> HttpResponse {
@@ -70,6 +80,7 @@ pub fn verify_driver_account(connection: &mut PgConnection, driver_id: Uuid) -> 
 // Driver app calls GET /drivers/notify-driver/{driver_uuid} and holds the connection open.
 // assign_driver sends the ride request into DRIVER_NOTIFY_CHANNELS when it selects this driver.
 pub async fn notify_driver_handler(
+    _auth: AuthGuard,
     pool: web::Data<DbPool>,
     driver_uuid: web::Path<Uuid>,
 ) -> HttpResponse {
@@ -113,6 +124,7 @@ pub fn get_ongoing_trips_count(connection: &mut PgConnection, driver_uuid: Uuid)
 }
 
 pub async fn driver_response_handler(
+    _auth: AuthGuard,
     pool: web::Data<DbPool>,
     payload: web::Json<DriverResponsePayload>,
 ) -> HttpResponse {
@@ -175,9 +187,13 @@ pub async fn driver_response_handler(
 }
 
 pub async fn preflight_check(
+    http_req: HttpRequest,
     pool: web::Data<DbPool>,
     req: web::Json<RidePreflightRequest>,
 ) -> HttpResponse {
+    if !verify_zazu_secret(&http_req) {
+        return HttpResponse::Unauthorized().json("Unauthorized");
+    }
 
     use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
@@ -268,12 +284,153 @@ pub async fn preflight_check(
 }
 
 
+fn verify_zazu_secret(req: &HttpRequest) -> bool {
+    let secret = env::var("ASAP_WEBHOOK_SECRET").unwrap_or_default();
+    req.headers()
+        .get("x-asap-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == secret)
+        .unwrap_or(false)
+}
+
+pub async fn register_zazu_url(
+    req: HttpRequest,
+    body: web::Json<ZazuUrlRegistration>,
+) -> HttpResponse {
+    if !verify_zazu_secret(&req) {
+        return HttpResponse::Unauthorized().json("Unauthorized");
+    }
+    let url = body.into_inner().url;
+    *ZAZU_URL.lock().await = url.clone();
+    println!("Zazu URL registered: {}", url);
+    HttpResponse::Ok().json("Zazu URL registered")
+}
+
+pub async fn update_bank_details(
+    _auth: AuthGuard,
+    pool: web::Data<DbPool>,
+    body: web::Json<UpdateBankDetailsRequest>,
+) -> HttpResponse {
+    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
+
+    let req = body.into_inner();
+    let result = web::block({
+        let pool = pool.clone();
+        move || -> Result<usize, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            diesel::update(drivers.filter(driver_id.eq(req.driver_id)))
+                .set((
+                    account_number.eq(req.account_number),
+                    bank_code.eq(req.bank_code),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| e.to_string())
+        }
+    }).await;
+
+    match result {
+        Ok(Ok(rows)) if rows > 0 => HttpResponse::Ok().json("Bank details updated"),
+        Ok(Ok(_)) => HttpResponse::NotFound().body("Driver not found"),
+        Ok(Err(e)) => HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Blocking error: {}", e)),
+    }
+}
+
+pub async fn confirm_pickup(
+    _auth: AuthGuard,
+    pool: web::Data<DbPool>,
+    body: web::Json<ConfirmPickupRequest>,
+) -> HttpResponse {
+    let payload = body.into_inner();
+
+    let driver = web::block({
+        let pool = pool.clone();
+        let driver_id = payload.driver_id;
+        move || -> Result<Driver, String> {
+            let mut conn = pool.get().map_err(|e| e.to_string())?;
+            verify_driver_account(&mut conn, driver_id)
+        }
+    }).await;
+
+    let driver = match driver {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => return HttpResponse::BadRequest().body(e),
+        Err(_) => return HttpResponse::InternalServerError().body("Server error"),
+    };
+
+    let account_number = match driver.account_number {
+        Some(v) => v,
+        None => return HttpResponse::BadRequest().body("Driver bank details not set"),
+    };
+    let bank_code = match driver.bank_code {
+        Some(v) => v,
+        None => return HttpResponse::BadRequest().body("Driver bank details not set"),
+    };
+
+    let zazu_url = ZAZU_URL.lock().await.clone();
+    if zazu_url.is_empty() {
+        return HttpResponse::InternalServerError().body("Zazu URL not configured");
+    }
+
+    let secret = env::var("ASAP_WEBHOOK_SECRET").unwrap_or_default();
+    let zazu_payload = serde_json::json!({
+        "order_ref":             payload.order_ref,
+        "pickup_code":           payload.pickup_code,
+        "driver_account_number": account_number,
+        "driver_bank_code":      bank_code,
+    });
+
+    let resp = Client::new()
+        .post(format!("{}/confirm-pickup", zazu_url))
+        .header("x-asap-secret", &secret)
+        .json(&zazu_payload)
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            // Payment authorised — complete the trip
+            let driver_id = driver.driver_id;
+            let pool2 = pool.clone();
+            let _ = web::block(move || -> Result<(), String> {
+                use crate::schema::back_trips::dsl as t;
+                let mut conn = pool2.get().map_err(|e| e.to_string())?;
+                use chrono::Utc;
+                diesel::update(
+                    t::back_trips
+                        .filter(t::driver_id.eq(driver_id))
+                        .filter(t::status.eq("driver_at_dropoff"))
+                )
+                .set((
+                    t::status.eq("Completed"),
+                    t::end_ts.eq(Some(Utc::now().timestamp() as i64)),
+                ))
+                .execute(&mut conn)
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            }).await;
+
+            let body = r.text().await.unwrap_or_default();
+            HttpResponse::Ok().body(body)
+        }
+        Ok(r) => {
+            let status = r.status();
+            let body = r.text().await.unwrap_or_default();
+            HttpResponse::BadGateway().body(format!("Zazu error {}: {}", status, body))
+        }
+        Err(e) => HttpResponse::InternalServerError().body(format!("Failed to reach Zazu: {}", e)),
+    }
+}
+
 pub fn routes() -> Scope {
     web::scope("/drivers")
         .route("/notify-driver/{driver_uuid}", web::get().to(notify_driver_handler))
         .route("/driver-response", web::post().to(driver_response_handler))
         .route("/update-driver", web::post().to(update_driver))
         .route("/ride-preflight", web::post().to(preflight_check))
+        .route("/update-bank-details", web::put().to(update_bank_details))
+        .route("/confirm-pickup", web::post().to(confirm_pickup))
+        .route("/register-zazu-url", web::post().to(register_zazu_url))
 }
 
 #[derive(Deserialize)]
@@ -341,7 +498,7 @@ pub struct RidePreflightResponse {
 pub struct Driver {
     pub driver_id: Uuid,
 #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    pub driver_pubkey: serde_json::Value,   ///treat with Privy
+    pub driver_pubkey: serde_json::Value,
     pub name: String,
     pub email: String,
     pub phone: String,
@@ -351,8 +508,10 @@ pub struct Driver {
     pub license_number: Option<String>,
     pub vehicle_type: String,
 #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    pub driver_response: serde_json::Value,   ///treat with Privy
+    pub driver_response: serde_json::Value,
     pub vehicle: Option<String>,
+    pub account_number: Option<String>,
+    pub bank_code: Option<String>,
 }
 
 impl Driver {
@@ -380,4 +539,23 @@ impl Driver {
 pub struct DriverUpdate {
     pub driver_location: serde_json::Value,
     pub driver_response: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub struct ZazuUrlRegistration {
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateBankDetailsRequest {
+    pub driver_id: Uuid,
+    pub account_number: String,
+    pub bank_code: String,
+}
+
+#[derive(Deserialize)]
+pub struct ConfirmPickupRequest {
+    pub order_ref: Uuid,
+    pub driver_id: Uuid,
+    pub pickup_code: String,
 }

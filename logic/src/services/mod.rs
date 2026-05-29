@@ -5,6 +5,7 @@ pub mod notifications;
 pub mod matching;
 pub mod escrow;
 pub mod paystack;
+pub mod auth;
 
 pub fn init(cfg: &mut ServiceConfig) {
     cfg.service(escrow::routes())

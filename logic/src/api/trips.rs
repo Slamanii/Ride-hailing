@@ -1,4 +1,5 @@
 use actix_web::{ web, HttpResponse, Scope };
+use crate::services::auth::AuthGuard;
 use serde::{ Deserialize, Serialize };
 use serde_json::Value;
 use uuid::Uuid;
@@ -66,6 +67,7 @@ pub async fn create_trip(
 
 
 pub async fn update_trip(
+    _auth: AuthGuard,
     pool: web::Data<DbPool>,
     rider_uuid: web::Path<Uuid>,
     body: web::Json<Trip>,
@@ -112,6 +114,7 @@ pub async fn update_trip(
 
 
 pub async fn get_trip(
+    _auth: AuthGuard,
     pool: web::Data<DbPool>,
     path: web::Path<String>,
 ) -> HttpResponse {
@@ -167,9 +170,9 @@ struct CreateTripInput {
     pub trip_id: [u8; 32],
     pub rider_id: Uuid,
     pub reference: String,
-    pub pick_up: String,
-    pub drop_off: String,
-    pub driver_location: String,
+    pub pick_up: serde_json::Value,
+    pub drop_off: serde_json::Value,
+    pub driver_location: serde_json::Value,
     pub rider_pubkey: String,
     pub driver_pubkey: String,
     pub driver_id: Uuid,
@@ -177,10 +180,11 @@ struct CreateTripInput {
     pub start_ts: i64,
     pub end_ts: Option<i64>,
     pub distance_km: f64,
-    pub item: serde_json::Value,  //treat in sql
+    pub item: serde_json::Value,
     pub fare_estimate: Option<i64>,
     pub fare_lamports: Option<i64>,
     pub rider_email: String,
+    pub order_ref: Option<Uuid>,
 }
 //you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
@@ -200,9 +204,9 @@ impl CreateTripInput {
             trip_id: trip_id_bytes,
             rider_id: rdr.rider_id,
             reference: Uuid::new_v4().to_string(),
-            pick_up: req2.pick_up.to_string(),
-            drop_off: req2.drop_off.to_string(),
-            driver_location: drv.driver_location.to_string(),
+            pick_up: req2.pick_up.clone(),
+            drop_off: req2.drop_off.clone(),
+            driver_location: drv.driver_location.clone(),
             rider_pubkey: rdr.rider_pubkey.to_string(),
             driver_pubkey: drv.driver_pubkey.to_string(),
             driver_id: drv.driver_id,
@@ -212,10 +216,9 @@ impl CreateTripInput {
             distance_km: req2.distance_km,
             item: req2.items.clone(),
             fare_estimate: Some(req2.estimated_price),
-            fare_lamports: None,  //we need to calculate this in pricing using fare_estimate
+            fare_lamports: None,
             rider_email: rdr.email,
-
-
+            order_ref: req2.order_ref,
         }
     }
 }
@@ -227,9 +230,12 @@ pub struct Trip {
     pub trip_id: Vec<u8>,
     pub rider_id: Uuid,
     pub reference: String,
-    pub pick_up: String,
-    pub drop_off: String,
-    pub driver_location: String,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub pick_up: serde_json::Value,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub drop_off: serde_json::Value,
+#[diesel(sql_type = diesel::sql_types::Jsonb)]
+    pub driver_location: serde_json::Value,
     pub rider_pubkey: String,
     pub driver_pubkey: String,
     pub driver_id: Uuid,
@@ -238,18 +244,18 @@ pub struct Trip {
     pub end_ts: Option<i64>,
     pub distance_km: f64,
 #[diesel(sql_type = diesel::sql_types::Jsonb)]
-    pub item: serde_json::Value,  //treat in sql
+    pub item: serde_json::Value,
     pub fare_estimate: Option<i64>,
     pub fare_lamports: Option<i64>,
     pub rider_email: String,
+    pub order_ref: Option<Uuid>,
 }
 //you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
 impl Trip {
 
 
-    pub fn update_status(&mut self)  {
-        
+    pub fn update_status(&mut self) {
         if self.driver_location == self.drop_off {
             self.status = "Completed".to_string();
             self.end_ts = Some(Utc::now().timestamp() as i64);

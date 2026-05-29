@@ -1,7 +1,5 @@
-use actix_web::{ get, post, web, Scope, HttpResponse, Responder};
+use actix_web::{ web, Scope, HttpResponse, Responder};
 use serde::{ Deserialize, Serialize };
-use diesel::dsl::sql;
-use serde_json::Value;
 use tokio::sync::{Mutex, oneshot};
 use lazy_static::lazy_static;
 use diesel::prelude::*;
@@ -10,11 +8,12 @@ use uuid::Uuid;
 use tokio::time::{ Duration, sleep, timeout };
 use std::collections::HashMap;
 use crate::db::{ DbPool };
-use crate::api::admin::{ Rider, NewRider };
-use crate::services::{escrow, pricing::{ GeoPoint, minimum_distance_between_driver_and_pickup, distance_between }};
+use crate::api::admin::Rider;
+use crate::services::pricing::{ GeoPoint, minimum_distance_between_driver_and_pickup, distance_between };
 use crate::services::pricing;
 use crate::services::notifications::calculate_eta;
 use crate::api::drivers::{ DriverResponse, DriverResponsePayloadOut, DriverInfo, Driver };
+use crate::services::auth::AuthGuard;
 
 
 lazy_static! {
@@ -24,6 +23,7 @@ lazy_static! {
 
 
 pub async fn assign_driver_handler(
+    _auth: AuthGuard,
     body: web::Json<NewRideRequest>,
     pool: web::Data<DbPool>,
 ) -> HttpResponse {
@@ -161,7 +161,7 @@ pub async fn run_assign_driver(pool: web::Data<DbPool>, body: NewRideRequest) ->
 
 
 // Called by the driver app to submit their accept/reject — feeds assign_driver's oneshot channel
-pub async fn driver_response(payload: web::Json<DriverResponsePayloadOut>) -> impl Responder {
+pub async fn driver_response(_auth: AuthGuard, payload: web::Json<DriverResponsePayloadOut>) -> impl Responder {
     let data = payload.into_inner();
 
     let (driver_id, response) = match data {
@@ -200,10 +200,11 @@ pub fn validate_rider_account(
 }
 
 pub async fn request_ride(
+    _auth: crate::services::auth::AnyAuthGuard,
     pool: web::Data<DbPool>,
     body: web::Json<CreateRideRequest>,
 ) -> HttpResponse {
-    use crate::schema::back_ride_request::dsl::{back_ride_request as ride_request, *};
+    use crate::schema::back_ride_request::dsl::back_ride_request as ride_request;
 
     let req = body.into_inner();
     let rider_uuid = req.rider_id;
@@ -256,7 +257,7 @@ pub struct CreateRideRequest {
     pub ride_type: RideType,
     pub payment_method: String,
     pub items: Vec<ItemDetails>,
-    pub order_id: Option<Uuid>, //from zazu
+    pub order_ref: Option<Uuid>, //from zazu
     pub user_id: Option<i64>,
     pub user_phone_number: Option<String>,
     pub vendor_phone_number: Option<String>,
@@ -275,7 +276,7 @@ pub struct NewRideRequest {
     pub ride_type: serde_json::Value,
     pub items: serde_json::Value,
     pub payment_method: String,
-    pub order_id: Option<Uuid>, //from zazu
+    pub order_ref: Option<Uuid>, //from zazu
     pub user_id: Option<i64>,
     pub user_phone_number: Option<String>,
     pub vendor_phone_number: Option<String>,
@@ -303,7 +304,7 @@ impl NewRideRequest {
             distance_km,
             estimated_time_min,
             payment_method: req.payment_method,
-            order_id: req.order_id,
+            order_ref: req.order_ref,
             user_id: req.user_id,
             user_phone_number: req.user_phone_number,
             vendor_phone_number: req.vendor_phone_number,
@@ -329,7 +330,7 @@ pub struct RideRequest {
     pub ride_type: serde_json::Value,
     pub items: serde_json::Value,
     pub payment_method: String,
-    pub order_id: Option<Uuid>, //from zazu
+    pub order_ref: Option<Uuid>, //from zazu
     pub user_id: Option<i64>,
     pub user_phone_number: Option<String>,
     pub vendor_phone_number: Option<String>,

@@ -110,9 +110,9 @@ fn make_trip() -> Trip {
         trip_id: vec![0u8; 32],
         rider_id: Uuid::new_v4(),
         reference: "ref-test-001".to_string(),
-        pick_up: "Lagos Island".to_string(),
-        drop_off: "Victoria Island".to_string(),
-        driver_location: "Lekki Phase 1".to_string(),
+        pick_up: serde_json::json!({"lat": 6.4531, "lng": 3.3958, "name": null}),
+        drop_off: serde_json::json!({"lat": 6.4280, "lng": 3.4219, "name": null}),
+        driver_location: serde_json::json!({"lat": 6.5244, "lng": 3.3792, "name": null}),
         rider_pubkey: "rider_pubkey_string".to_string(),
         driver_pubkey: "driver_pubkey_string".to_string(),
         driver_id: Uuid::new_v4(),
@@ -124,6 +124,7 @@ fn make_trip() -> Trip {
         fare_estimate: Some(1500),
         fare_lamports: None,
         rider_email: "rider@test.com".to_string(),
+        order_ref: None,
     }
 }
 

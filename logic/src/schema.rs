@@ -72,6 +72,8 @@ diesel::table! {
         vehicle_type -> Text,
         driver_response -> Jsonb,
         vehicle -> Nullable<Text>,
+        account_number -> Nullable<Text>,
+        bank_code -> Nullable<Text>,
     }
 }
 
@@ -118,7 +120,7 @@ diesel::table! {
         ride_type -> Jsonb,
         items -> Jsonb,
         payment_method -> Text,
-        order_id -> Nullable<Uuid>,
+        order_ref -> Nullable<Uuid>,
         user_id -> Nullable<Int8>,
         user_phone_number -> Nullable<Text>,
         vendor_phone_number -> Nullable<Text>,
@@ -165,9 +167,9 @@ diesel::table! {
         trip_id -> Bytea,
         rider_id -> Uuid,
         reference -> Text,
-        pick_up -> Text,
-        drop_off -> Text,
-        driver_location -> Text,
+        pick_up -> Jsonb,
+        drop_off -> Jsonb,
+        driver_location -> Jsonb,
         rider_pubkey -> Text,
         driver_pubkey -> Text,
         driver_id -> Uuid,
@@ -179,6 +181,7 @@ diesel::table! {
         fare_estimate -> Nullable<Int8>,
         fare_lamports -> Nullable<Int8>,
         rider_email -> Text,
+        order_ref -> Nullable<Uuid>,
     }
 }
 

@@ -217,9 +217,9 @@ pub struct DriverRequest {
     pub license_number: Option<String>,
     pub vehicle_type: String,
     pub vehicle: Option<String>,
+    pub account_number: Option<String>,
+    pub bank_code: Option<String>,
 }
-
-
 
 #[derive(Insertable, Deserialize, Clone)]
 #[diesel(table_name = crate::schema::back_drivers)]
@@ -235,8 +235,9 @@ pub struct NewDriver {
     pub vehicle_type: String,
     pub driver_response: serde_json::Value,
     pub vehicle: Option<String>,
+    pub account_number: Option<String>,
+    pub bank_code: Option<String>,
 }
-
 
 impl NewDriver {
     pub fn new(req: DriverRequest) -> Self {
@@ -252,6 +253,8 @@ impl NewDriver {
             vehicle_type: req.vehicle_type,
             driver_response: serde_json::to_value(DriverResponse::Timeout).expect("serialize driver response"),
             vehicle: req.vehicle,
+            account_number: req.account_number,
+            bank_code: req.bank_code,
         }
     }
 }
