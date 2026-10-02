@@ -231,7 +231,8 @@ pub async fn preflight_check(
                     .filter(vehicle_type.eq_any(&vehicle_filter))
                     .filter(status.eq("available"))
                     .limit(50)
-                    .load::<Driver>(&mut conn)
+                    .select(Driver::as_select())
+                    .load(&mut conn)
                     .map_err(|_| "Query failed")
             }
         }).await;

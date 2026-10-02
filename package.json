@@ -1,5 +1,5 @@
 {
-  "name": "asap-scaffold",
+  "name": "asap_rustly",
   "private": true,
   "workspaces": [
     "web",

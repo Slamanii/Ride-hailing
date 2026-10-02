@@ -14,12 +14,13 @@ diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::CustomRoles;
 
-    custom_users (id) {
+    app_custom_users (id) {
         id -> Uuid,
         created_at -> Timestamptz,
         username -> Text,
         custom_role -> CustomRoles,
-        phone -> Nullable<Int8>,
+        phone -> Nullable<Text>,
+        profileImage -> Nullable<Text>,
     }
 }
 
@@ -27,7 +28,7 @@ diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::DeliveryStatus;
 
-    delivery_orders (id) {
+    app_delivery_orders (id) {
         id -> Int8,
         created_at -> Timestamptz,
         client_id -> Uuid,
@@ -38,13 +39,10 @@ diesel::table! {
         dropoff_long -> Nullable<Numeric>,
         driver_initial_lat -> Nullable<Numeric>,
         driver_initial_long -> Nullable<Numeric>,
-        driver_package_current_lat -> Nullable<Numeric>,
-        driver_package_current_long -> Nullable<Numeric>,
         status -> DeliveryStatus,
         order_code -> Text,
         driver_id -> Nullable<Uuid>,
         modified_at -> Timestamptz,
-        drivers_waypoints -> Nullable<Jsonb>,
         pickup_name -> Nullable<Text>,
         dropoff_name -> Nullable<Text>,
         dropoff_code -> Nullable<Text>,
@@ -56,6 +54,91 @@ diesel::table! {
         delivery_accepted_time -> Nullable<Timestamptz>,
         package_description -> Nullable<Text>,
         package_type -> Nullable<Text>,
+        initial_waypoints -> Nullable<Jsonb>,
+        source -> Text,
+        customer_phone -> Nullable<Text>,
+        pickup_contact_name -> Nullable<Text>,
+        pickup_contact_phone -> Nullable<Text>,
+        payment_reference -> Nullable<Text>,
+        cancelled_at -> Nullable<Timestamptz>,
+        cancelled_by -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    app_delivery_orders_waypoints (created_at, id) {
+        order_id -> Int8,
+        lat -> Nullable<Numeric>,
+        long -> Nullable<Numeric>,
+        created_at -> Timestamptz,
+        id -> Int8,
+    }
+}
+
+diesel::table! {
+    app_locations (id) {
+        id -> Int8,
+        created_at -> Timestamptz,
+        longitude -> Numeric,
+        latitude -> Numeric,
+        frontend_order_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    app_messages (id) {
+        id -> Int8,
+        created_at -> Timestamptz,
+        sender_id -> Uuid,
+        receiver_id -> Uuid,
+        delivery_order_id -> Int8,
+        message -> Text,
+        is_read -> Bool,
+        image_url -> Nullable<Text>,
+    }
+}
+
+diesel::table! {
+    app_package_images (id) {
+        id -> Int8,
+        created_at -> Timestamptz,
+        url -> Text,
+        user_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use super::sql_types::CustomRoles;
+
+    app_riders_current_status (id) {
+        id -> Uuid,
+        updated_at -> Timestamptz,
+        email -> Varchar,
+        longitude -> Numeric,
+        latitude -> Numeric,
+        active_mode -> CustomRoles,
+    }
+}
+
+diesel::table! {
+    app_saved_locations (id) {
+        id -> Int8,
+        created_at -> Timestamptz,
+        name -> Nullable<Text>,
+        latitude -> Nullable<Numeric>,
+        longitude -> Nullable<Numeric>,
+        user_id -> Nullable<Uuid>,
+    }
+}
+
+diesel::table! {
+    back_custom_users (rider_id) {
+        rider_id -> Uuid,
+        rider_pubkey -> Jsonb,
+        name -> Text,
+        email -> Text,
+        phone -> Text,
     }
 }
 
@@ -74,37 +157,7 @@ diesel::table! {
         vehicle -> Nullable<Text>,
         account_number -> Nullable<Text>,
         bank_code -> Nullable<Text>,
-    }
-}
-
-diesel::table! {
-    locations (id) {
-        id -> Int8,
-        created_at -> Timestamptz,
-        longitude -> Numeric,
-        latitude -> Numeric,
-        frontend_order_id -> Uuid,
-    }
-}
-
-diesel::table! {
-    messages (id) {
-        id -> Int8,
-        created_at -> Timestamptz,
-        sender_id -> Uuid,
-        receiver_id -> Uuid,
-        delivery_order_id -> Int8,
-        message -> Text,
-        is_read -> Bool,
-    }
-}
-
-diesel::table! {
-    package_images (id) {
-        id -> Int8,
-        created_at -> Timestamptz,
-        url -> Text,
-        user_id -> Uuid,
+        tier -> Nullable<Text>,
     }
 }
 
@@ -128,41 +181,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    back_custom_users (rider_id) {
-        rider_id -> Uuid,
-        rider_pubkey -> Jsonb,
-        name -> Text,
-        email -> Text,
-        phone -> Text,
-    }
-}
-
-diesel::table! {
-    use diesel::sql_types::*;
-    use super::sql_types::CustomRoles;
-
-    riders_current_status (id) {
-        id -> Uuid,
-        updated_at -> Timestamptz,
-        email -> Varchar,
-        longitude -> Numeric,
-        latitude -> Numeric,
-        active_mode -> CustomRoles,
-    }
-}
-
-diesel::table! {
-    saved_locations (id) {
-        id -> Int8,
-        created_at -> Timestamptz,
-        name -> Nullable<Text>,
-        latitude -> Nullable<Numeric>,
-        longitude -> Nullable<Numeric>,
-        user_id -> Nullable<Uuid>,
-    }
-}
-
-diesel::table! {
     back_trips (trip_id) {
         trip_id -> Bytea,
         rider_id -> Uuid,
@@ -180,23 +198,26 @@ diesel::table! {
         item -> Jsonb,
         fare_estimate -> Nullable<Int8>,
         fare_lamports -> Nullable<Int8>,
-        rider_email -> Text,
         order_ref -> Nullable<Uuid>,
+        rider_email -> Text,
     }
 }
 
-diesel::joinable!(messages -> delivery_orders (delivery_order_id));
+diesel::joinable!(app_delivery_orders_waypoints -> app_delivery_orders (order_id));
+diesel::joinable!(app_messages -> app_delivery_orders (delivery_order_id));
+diesel::joinable!(back_trips -> back_drivers (driver_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
-    custom_users,
-    delivery_orders,
-    back_drivers,
-    locations,
-    messages,
-    package_images,
-    back_ride_request,
+    app_custom_users,
+    app_delivery_orders,
+    app_delivery_orders_waypoints,
+    app_locations,
+    app_messages,
+    app_package_images,
+    app_riders_current_status,
+    app_saved_locations,
     back_custom_users,
-    riders_current_status,
-    saved_locations,
+    back_drivers,
+    back_ride_request,
     back_trips,
 );

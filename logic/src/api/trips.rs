@@ -183,8 +183,8 @@ struct CreateTripInput {
     pub item: serde_json::Value,
     pub fare_estimate: Option<i64>,
     pub fare_lamports: Option<i64>,
-    pub rider_email: String,
     pub order_ref: Option<Uuid>,
+    pub rider_email: String,
 }
 //you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
@@ -247,8 +247,8 @@ pub struct Trip {
     pub item: serde_json::Value,
     pub fare_estimate: Option<i64>,
     pub fare_lamports: Option<i64>,
-    pub rider_email: String,
     pub order_ref: Option<Uuid>,
+    pub rider_email: String,
 }
 //you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 

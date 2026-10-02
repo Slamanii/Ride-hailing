@@ -4,6 +4,22 @@
 [print_schema]
 file = "logic/src/schema.rs"
 custom_type_derives = ["diesel::query_builder::QueryId", "Clone"]
+# Shared DB: only the backend's back_* tables and the ASAP_APPS app_* tables it mirrors.
+# Migrations in this repo must only touch back_* tables.
+filter = { only_tables = [
+    "^back_custom_users$",
+    "^back_drivers$",
+    "^back_ride_request$",
+    "^back_trips$",
+    "^app_custom_users$",
+    "^app_delivery_orders$",
+    "^app_delivery_orders_waypoints$",
+    "^app_locations$",
+    "^app_messages$",
+    "^app_package_images$",
+    "^app_riders_current_status$",
+    "^app_saved_locations$",
+] }
 
 [migrations_directory]
-dir = "/Users/mac/Downloads/asap-scaffold/migrations"
+dir = "migrations"
