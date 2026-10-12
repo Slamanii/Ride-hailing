@@ -1,26 +1,19 @@
 use std::env;
-use solana_sdk::pubkey::Pubkey;
 
+// What the server needs to start. Payment and Solana settings are read where they're used
+// (korapay.rs, escrow.rs), so a missing one fails that call instead of the whole server.
 pub struct AppConfig {
     pub database_url: String,
-    pub secret_key: String,
-    pub program_id: Pubkey,
-    pub solana_rpc_url: String,
 }
 
 impl AppConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env() -> Result<Self, String> {
         dotenv::dotenv().ok(); // load .env
 
-        Self {
-            database_url: env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
-            secret_key: env::var("PAYSTACK_SECRET").expect("PAYSTACK_SECRET must be set"),
-            program_id: env::var("SOLANA_PROGRAM_ID")
-                .expect("SOLANA_PROGRAM_ID must be set")
-                .parse()
-                .expect("Invalid program ID"),
-            solana_rpc_url: env::var("SOLANA_RPC_URL")
-                .unwrap_or_else(|_| "https://api.devnet.solana.com".into()),
-        }
+        let database_url = env::var("DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or("DATABASE_URL must be set")?;
+        Ok(Self { database_url })
     }
 }

@@ -2,102 +2,75 @@
 # simulate_driver.sh — simulates the driver app for one driver in the local test flow.
 #
 # Flow:
-#   1. Long-polls GET /drivers/notify-driver/{uuid}  (blocks until assign_driver fires)
-#   2. Auto-accepts via POST /drivers/driver-response
-#   3. Feeds DriverResponsePayloadOut to POST /riders/wait-driver-response
+#   1. Polls app_ride_offers through Supabase REST (as the driver app sees it, RLS-scoped
+#      to the signed-in driver) for an open offer or an unstarted assigned delivery
+#   2. Accepts it (or taps Start) via POST /drivers/driver-response { offer_id, accepted }
 #
-# Usage: ./scripts/simulate_driver.sh [BASE_URL] <DRIVER_UUID>
-# Example: ./scripts/simulate_driver.sh http://localhost:8080 e5f2a1b3-...
+# The driver is whoever DRIVER_JWT belongs to; the backend takes the id from the token.
 #
-# Run this in a separate terminal for each driver you want to simulate BEFORE
-# the rider/Zazu triggers POST /riders/assign-driver.
+# Usage: DRIVER_JWT=... SUPABASE_URL=... SUPABASE_ANON_KEY=... ./scripts/simulate_driver.sh [BASE_URL]
+#   BASE_URL defaults to http://localhost:8081
+#
+# Run this in a separate terminal for each driver BEFORE POST /riders/ride-request.
 
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-  echo "Usage: $0 [BASE_URL] <DRIVER_UUID>" >&2
-  echo "  BASE_URL defaults to http://localhost:8081" >&2
-  exit 1
-fi
+BASE_URL="${1:-http://localhost:8081}"
+: "${DRIVER_JWT:?DRIVER_JWT (Supabase access token of the driver) is required}"
+: "${SUPABASE_URL:?SUPABASE_URL is required}"
+: "${SUPABASE_ANON_KEY:?SUPABASE_ANON_KEY is required}"
 
-# Accept optional BASE_URL as first arg if it starts with http
-if [[ "$1" == http* ]]; then
-  BASE_URL="$1"
-  DRIVER_UUID="${2:?Driver UUID required as second argument}"
-else
-  BASE_URL="http://localhost:8081"
-  DRIVER_UUID="$1"
-fi
+# The token's sub is the driver id (base64url payload, padded for base64 -d).
+PAYLOAD=$(echo "$DRIVER_JWT" | cut -d. -f2 | tr '_-' '/+')
+while [ $(( ${#PAYLOAD} % 4 )) -ne 0 ]; do PAYLOAD="$PAYLOAD="; done
+DRIVER_UUID=$(echo "$PAYLOAD" | base64 -d 2>/dev/null | jq -r '.sub')
 
-echo "[driver:$DRIVER_UUID] Starting long-poll loop..."
-echo "[driver:$DRIVER_UUID] Endpoint: GET $BASE_URL/drivers/notify-driver/$DRIVER_UUID"
-echo "[driver:$DRIVER_UUID] (Ctrl+C to stop)"
+echo "[driver:$DRIVER_UUID] Polling for offers every 2s (Ctrl+C to stop)..."
 echo ""
 
-# ── Step 1: long-poll loop — reconnects automatically if connection drops ─────
-RIDE_REQUEST=""
+# ── Step 1: poll for an offer that still needs an answer ─────────────────────
+OFFER=""
 while true; do
-  echo "[driver:$DRIVER_UUID] Waiting for ride request..."
-  RIDE_REQUEST=$(curl -sf --max-time 0 \
-    "$BASE_URL/drivers/notify-driver/$DRIVER_UUID" 2>/dev/null)
+  NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  OFFER=$(curl -sf -G "$SUPABASE_URL/rest/v1/app_ride_offers" \
+    -H "apikey: $SUPABASE_ANON_KEY" \
+    -H "Authorization: Bearer $DRIVER_JWT" \
+    --data-urlencode "status=in.(pending,accepted)" \
+    --data-urlencode "responded_at=is.null" \
+    --data-urlencode "expires_at=gt.$NOW" \
+    --data-urlencode "order=created_at.desc" \
+    --data-urlencode "limit=1" 2>/dev/null | jq -c '.[0] // empty' || true)
 
-  if [ -n "$RIDE_REQUEST" ]; then
-    break  # got a ride request, proceed
+  if [ -n "$OFFER" ]; then
+    break
   fi
-
-  echo "[driver:$DRIVER_UUID] Connection dropped or server error — reconnecting in 3s..."
-  sleep 3
+  sleep 2
 done
 
-echo "[driver:$DRIVER_UUID] Got ride request:"
-echo "$RIDE_REQUEST" | jq .
+echo "[driver:$DRIVER_UUID] Got offer:"
+echo "$OFFER" | jq .
 echo ""
 
-# Extract rider_id from the NewRideRequest JSON
-RIDER_ID=$(echo "$RIDE_REQUEST" | jq -r '.rider_id // empty')
+OFFER_ID=$(echo "$OFFER" | jq -r '.id')
+KIND=$(echo "$OFFER" | jq -r 'if .status == "accepted" then "assigned delivery — tapping Start" else "offer — accepting" end')
+echo "[driver:$DRIVER_UUID] $KIND..."
 
-if [ -z "$RIDER_ID" ]; then
-  echo "[driver:$DRIVER_UUID] ERROR: could not extract rider_id from ride request" >&2
-  echo "Raw response: $RIDE_REQUEST" >&2
+# ── Step 2: answer it ────────────────────────────────────────────────────────
+RESULT=$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/drivers/driver-response" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $DRIVER_JWT" \
+  -d "{ \"offer_id\": \"$OFFER_ID\", \"accepted\": true }")
+
+CODE=$(echo "$RESULT" | tail -n1)
+BODY=$(echo "$RESULT" | sed '$d')
+
+echo "[driver:$DRIVER_UUID] driver-response ($CODE):"
+echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+echo ""
+
+if [ "$CODE" != "200" ]; then
+  echo "[driver:$DRIVER_UUID] Answer was refused" >&2
   exit 1
 fi
-
-echo "[driver:$DRIVER_UUID] rider_id=$RIDER_ID — auto-accepting..."
-echo ""
-
-# ── Step 2: call driver-response to accept the ride ──────────────────────────
-DRIVER_RESPONSE=$(curl -sf -X POST "$BASE_URL/drivers/driver-response" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"driver_id\": \"$DRIVER_UUID\",
-    \"rider_id\":  \"$RIDER_ID\",
-    \"response\":  \"accepted\"
-  }")
-
-if [ -z "$DRIVER_RESPONSE" ]; then
-  echo "[driver:$DRIVER_UUID] ERROR: empty response from /drivers/driver-response" >&2
-  exit 1
-fi
-
-echo "[driver:$DRIVER_UUID] driver-response result:"
-echo "$DRIVER_RESPONSE" | jq .
-echo ""
-
-# Check that we got an "accepted" status back
-STATUS=$(echo "$DRIVER_RESPONSE" | jq -r '.status // empty')
-if [ "$STATUS" != "accepted" ]; then
-  echo "[driver:$DRIVER_UUID] WARNING: unexpected status '$STATUS' — response may have been rejected by server" >&2
-fi
-
-# ── Step 3: feed DriverResponsePayloadOut to assign_driver's oneshot channel ─
-echo "[driver:$DRIVER_UUID] Forwarding acceptance to /riders/wait-driver-response..."
-
-ASSIGN_RESULT=$(curl -sf -X POST "$BASE_URL/riders/wait-driver-response" \
-  -H "Content-Type: application/json" \
-  -d "$DRIVER_RESPONSE")
-
-echo "[driver:$DRIVER_UUID] assign_driver result:"
-echo "$ASSIGN_RESULT" | jq . 2>/dev/null || echo "$ASSIGN_RESULT"
-echo ""
 
 echo "[driver:$DRIVER_UUID] Simulation complete."

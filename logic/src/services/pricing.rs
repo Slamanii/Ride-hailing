@@ -1,6 +1,5 @@
 use crate::api::riders::{ RideType };
 use serde::{ Serialize, Deserialize };
-use diesel::prelude::*;
 
 
 const TRAFFIC_FACTOR: f64 = 1.3; //this needs to be recalculated using driver tracking data
@@ -77,8 +76,12 @@ pub fn minimum_distance_between_driver_and_pickup(
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GeoPoint {
+    // The customer app sends { latitude, longitude }.
+    #[serde(alias = "latitude")]
     pub lat: f64,
+    #[serde(alias = "longitude")]
     pub lng: f64,
+    #[serde(default)]
     pub name: Option<String>,
 }
 

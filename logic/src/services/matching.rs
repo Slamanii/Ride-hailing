@@ -1,19 +1,29 @@
-use actix_web::{ web, Scope, HttpResponse };
+use actix_web::{ web, Scope, HttpResponse, http::StatusCode };
 use diesel::prelude::*;
-use diesel::sql_types::Jsonb;
+use diesel::sql_types::{ BigInt, Double, Uuid as SqlUuid };
 use diesel::pg::PgConnection;
 use uuid::Uuid;
-use serde_json::Value;
 use serde::{ Deserialize, Serialize };
-use crate::services::pricing::{GeoPoint, distance_between};
-use crate::services::auth::AuthGuard;
-use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
-use crate::schema::back_ride_request::dsl::{back_ride_request as ride_request, *};
-use crate::db::DbPool;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::env;
 use reqwest::Client;
+use lazy_static::lazy_static;
+use crate::services::pricing::{GeoPoint, distance_between};
+use crate::services::auth::AuthUser;
+use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
+use crate::schema::back_ride_request::dsl::{back_ride_request as ride_request, *};
+use crate::api::errors::{ ApiError, blocking, json_error };
+use crate::db::DbPool;
 
 const ARRIVAL_THRESHOLD_KM: f64 = 0.15; // 150 metres
+
+lazy_static! {
+    // Zazu orders already reported as at the drop-off, so later location updates don't repeat it.
+    // In memory: after a restart an arrival may be reported once more.
+    static ref ARRIVAL_SENT: Mutex<HashSet<i64>> = Mutex::new(HashSet::new());
+}
+const ARRIVAL_SENT_CAP: usize = 10_000;
 
 struct ZazuArrivalPayload {
     order_ref: Uuid,
@@ -22,104 +32,87 @@ struct ZazuArrivalPayload {
 }
 
 
+// The path id is only used for pick_up/drop_off, where it is the ride request's id and the
+// request must belong to the signed-in rider. A driver location always updates the signed-in
+// driver; the path id is ignored there.
 pub async fn process_geolocation(
-    _auth: AuthGuard,
+    auth: AuthUser,
     pool: web::Data<DbPool>,
     path: web::Path<Uuid>,
     payload: web::Json<GeoPointRequest>,
 ) -> HttpResponse {
+    let me = auth.user_id;
     let id = path.into_inner();
     let gp = GeoPoint::new(payload.lat, payload.lng, payload.name.clone());
     let kind = payload.kind.clone();
-    let new_lat = payload.lat;
-    let new_lng = payload.lng;
+    let (new_lat, new_lng) = (payload.lat, payload.lng);
 
-    let result = web::block({
-        let pool = pool.clone();
-        move || -> Result<(usize, Option<ZazuArrivalPayload>), String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            match kind {
-                GeoPointKind::DriverLocation => {
-                    let rows = update_driver_location(&mut conn, id, &gp)
-                        .map_err(|e| format!("{:?}", e))?;
-                    let arrived = check_dropoff_arrival(&mut conn, id, new_lat, new_lng)?;
-                    Ok((rows, arrived))
-                }
-                GeoPointKind::PickUp => {
-                    let rows = update_request_pickup(&mut conn, id, &gp)
-                        .map_err(|e| format!("{:?}", e))?;
-                    Ok((rows, None))
-                }
-                GeoPointKind::DropOff => {
-                    let rows = update_request_dropoff(&mut conn, id, &gp)
-                        .map_err(|e| format!("{:?}", e))?;
-                    Ok((rows, None))
-                }
+    let result = blocking(&pool, move |conn| -> Result<(usize, Vec<ZazuArrivalPayload>), ApiError> {
+        match kind {
+            GeoPointKind::DriverLocation => {
+                let rows = update_driver_location(conn, me, &gp)?;
+                Ok((rows, check_dropoff_arrival(conn, me, new_lat, new_lng)?))
             }
+            GeoPointKind::PickUp => Ok((update_request_pickup(conn, id, me, &gp)?, Vec::new())),
+            GeoPointKind::DropOff => Ok((update_request_dropoff(conn, id, me, &gp)?, Vec::new())),
         }
     }).await;
 
     match result {
-        Ok(Ok((rows, arrived))) if rows > 0 => {
-            if let Some(info) = arrived {
-                tokio::spawn(async move {
-                    notify_zazu_driver_arrived(info).await;
-                });
+        Ok((rows, arrivals)) if rows > 0 => {
+            for info in arrivals {
+                tokio::spawn(notify_zazu_driver_arrived(info));
             }
-            HttpResponse::Ok().json(serde_json::json!({"status":"ok"}))
+            HttpResponse::Ok().json(serde_json::json!({ "status": "ok" }))
         }
-        Ok(Ok(_)) => HttpResponse::NotFound().body("Row not found"),
-        Ok(Err(e)) => HttpResponse::InternalServerError().body(format!("DB error: {:?}", e)),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Task error: {}", e)),
+        Ok(_) => json_error(StatusCode::NOT_FOUND, "Row not found"),
+        Err(e) => e.response(),
     }
 }
 
+#[derive(QueryableByName)]
+struct InTransitZazuOrder {
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    // Not `order_ref`: the back_ride_request glob import above makes that name a column struct.
+    #[diesel(sql_type = SqlUuid)]
+    zazu_order_ref: Uuid,
+    #[diesel(sql_type = Double)]
+    dropoff_lat: f64,
+    #[diesel(sql_type = Double)]
+    dropoff_long: f64,
+}
 
+// The driver's in-transit Zazu orders whose drop-off they just reached, each reported once.
 fn check_dropoff_arrival(
     conn: &mut PgConnection,
     driver_id_val: Uuid,
     lat: f64,
     lng: f64,
-) -> Result<Option<ZazuArrivalPayload>, String> {
-    use crate::schema::back_trips::dsl as t;
-
-    let active = t::back_trips
-        .filter(t::driver_id.eq(driver_id_val))
-        .filter(t::status.eq("Ongoing"))
-        .select((t::drop_off, t::order_ref))
-        .first::<(serde_json::Value, Option<Uuid>)>(conn)
-        .optional()
-        .map_err(|e| e.to_string())?;
-
-    let (dropoff_val, order_ref_opt) = match active {
-        Some(row) => row,
-        None => return Ok(None),
-    };
-
-    let dropoff_gp: GeoPoint = serde_json::from_value(dropoff_val)
-        .map_err(|e| format!("Invalid drop_off in trip: {}", e))?;
-
-    let driver_gp = GeoPoint { lat, lng, name: None };
-
-    if distance_between(&driver_gp, &dropoff_gp) > ARRIVAL_THRESHOLD_KM {
-        return Ok(None);
-    }
-
-    // Mark driver as at dropoff to prevent re-firing on subsequent location updates
-    diesel::update(
-        t::back_trips
-            .filter(t::driver_id.eq(driver_id_val))
-            .filter(t::status.eq("Ongoing"))
+) -> QueryResult<Vec<ZazuArrivalPayload>> {
+    let orders: Vec<InTransitZazuOrder> = diesel::sql_query(
+        "SELECT id, order_ref AS zazu_order_ref, dropoff_lat::float8 AS dropoff_lat, dropoff_long::float8 AS dropoff_long \
+         FROM app_delivery_orders \
+         WHERE driver_id = $1 AND status = 'in_transit' AND lower(source) = 'zazu' \
+           AND order_ref IS NOT NULL AND dropoff_lat IS NOT NULL AND dropoff_long IS NOT NULL"
     )
-    .set(t::status.eq("driver_at_dropoff"))
-    .execute(conn)
-    .map_err(|e| e.to_string())?;
+    .bind::<SqlUuid, _>(driver_id_val)
+    .load(conn)?;
 
-    // Only notify Zazu if this is a Zazu order
-    match order_ref_opt {
-        Some(ord) => Ok(Some(ZazuArrivalPayload { order_ref: ord, driver_lat: lat, driver_lng: lng })),
-        None => Ok(None),
+    let here = GeoPoint { lat, lng, name: None };
+    let mut sent = ARRIVAL_SENT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if sent.len() > ARRIVAL_SENT_CAP {
+        sent.clear();
     }
+
+    Ok(orders.into_iter()
+        .filter(|order| {
+            let dropoff = GeoPoint { lat: order.dropoff_lat, lng: order.dropoff_long, name: None };
+            distance_between(&here, &dropoff) <= ARRIVAL_THRESHOLD_KM
+        })
+        .filter(|order| sent.insert(order.id))
+        .map(|order| ZazuArrivalPayload { order_ref: order.zazu_order_ref, driver_lat: lat, driver_lng: lng })
+        .collect())
 }
 
 
@@ -152,36 +145,45 @@ async fn notify_zazu_driver_arrived(info: ZazuArrivalPayload) {
 }
 
 
+fn to_json(gp: &GeoPoint) -> QueryResult<serde_json::Value> {
+    serde_json::to_value(gp).map_err(|e| diesel::result::Error::SerializationError(Box::new(e)))
+}
+
 pub fn update_driver_location(
     conn: &mut PgConnection,
     driver_id_val: Uuid,
     gp: &GeoPoint,
 ) -> QueryResult<usize> {
-    let jsonl = serde_json::to_value(gp).expect("serialize GeoPoint");
     diesel::update(drivers.filter(driver_id.eq(&driver_id_val)))
-        .set(DriverUpdateLocation { driver_location: jsonl })
+        .set((
+            DriverUpdateLocation { driver_location: to_json(gp)? },
+            location_updated_at.eq(crate::api::riders::db_now_nullable()),
+        ))
         .execute(conn)
 }
 
+// Only the rider's own request; someone else's request id updates nothing (404).
 pub fn update_request_pickup(
     conn: &mut PgConnection,
     other_request_id: Uuid,
+    rider: Uuid,
     gp: &GeoPoint,
 ) -> QueryResult<usize> {
-    let jsonp = serde_json::to_value(gp).expect("serialize GeoPoint");
-    diesel::update(ride_request.filter(request_id.eq(&other_request_id)))
-        .set(RideRequestUpdateLocation { pick_up: jsonp })
+    use crate::schema::back_ride_request::dsl::rider_id as request_rider_id;
+    diesel::update(ride_request.filter(request_id.eq(&other_request_id)).filter(request_rider_id.eq(rider)))
+        .set(RideRequestUpdateLocation { pick_up: to_json(gp)? })
         .execute(conn)
 }
 
 pub fn update_request_dropoff(
     conn: &mut PgConnection,
     other_request_id: Uuid,
+    rider: Uuid,
     gp: &GeoPoint,
 ) -> QueryResult<usize> {
-    let jsond = serde_json::to_value(gp).expect("serialize GeoPoint");
-    diesel::update(ride_request.filter(request_id.eq(&other_request_id)))
-        .set(RideRequestUpdateDropOffLocation { drop_off: jsond })
+    use crate::schema::back_ride_request::dsl::rider_id as request_rider_id;
+    diesel::update(ride_request.filter(request_id.eq(&other_request_id)).filter(request_rider_id.eq(rider)))
+        .set(RideRequestUpdateDropOffLocation { drop_off: to_json(gp)? })
         .execute(conn)
 }
 

@@ -113,8 +113,8 @@ fn make_trip() -> Trip {
         pick_up: serde_json::json!({"lat": 6.4531, "lng": 3.3958, "name": null}),
         drop_off: serde_json::json!({"lat": 6.4280, "lng": 3.4219, "name": null}),
         driver_location: serde_json::json!({"lat": 6.5244, "lng": 3.3792, "name": null}),
-        rider_pubkey: "rider_pubkey_string".to_string(),
-        driver_pubkey: "driver_pubkey_string".to_string(),
+        rider_pubkey: Some("rider_pubkey_string".to_string()),
+        driver_pubkey: Some("driver_pubkey_string".to_string()),
         driver_id: Uuid::new_v4(),
         status: "Ongoing".to_string(),
         start_ts: 1700000000,
@@ -176,10 +176,11 @@ fn trip_end_ts_set_on_completion() {
 fn make_item(length: f64, width: f64, height: f64, weight: f64, quantity: u32) -> ItemDetails {
     ItemDetails {
         name: "test_item".to_string(),
-        price: 500,
+        price: 500.0,
         dimensions: (length, width, height),
         quantity,
         weight,
+        image_url: None,
     }
 }
 
@@ -197,7 +198,7 @@ fn item_dimensions_at_exact_limit_ok() {
 
 #[test]
 fn item_dimensions_over_limit_err() {
-    let item = make_item(14.0, 14.0, 14.0, 1.0, 1);
+    let item = make_item(50.0, 50.0, 50.0, 1.0, 1);
     assert!(item.max_dimensions().is_err());
 }
 

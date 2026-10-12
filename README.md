@@ -127,61 +127,36 @@ This endpoint creates a new driver account in db using new driver request that t
 
 
 
-## 6. Notify Driver Handler
+## 6. How drivers receive orders
 
-```http
-GET /drivers/notify-driver
+There is no endpoint to hold open. Every offer is a row in `app_ride_offers`, and inserting it pushes the offer to the driver's device (`notify_ride_offer` trigger). The driver app reads its own offers through Supabase (RLS: `driver_id = auth.uid()`), so an offer survives the screen being off or the app being killed.
 
-```
+Orders are dispatched in one of two modes, chosen by the order's `source` (`ASSIGNED_DISPATCH_SOURCES`, default `zazu`):
 
-## Description
-This endpoint creates a new connection between the driver frontend app or mobile and rider frontend app by returning the every new ride request to a certain driver account if requirements are met.
+- **offer** (app orders): row inserted as `pending` with a 50 second window. The driver accepts or declines; the search moves to the next closest driver on decline or expiry.
+- **assigned** (Zazu orders): the order is given to the closest free driver straight away and the row is inserted as `accepted` with `responded_at` empty. The driver can only tap Start. If they don't within 60 seconds, the order is taken back and given to the next driver.
 
-## Example Ride Request Body
-```json
-{
-  "rider_id": "uuid-string",
-  "pick_up": "Pickup location",
-  "drop_off": "Dropoff location",
-  "driver_location": "Driver current location",
-  "rider_pubkey": "solana_pubkey_string",
-  "driver_pubkey": "solana_pubkey_string",
-  "driver_id": "uuid-string",
-  "distance_km": 12.4,
-  "item": {
-    "type": "package",
-    "weight": "2kg"
-  },
-  "fare_estimate": 4500,
-  "rider_email": "user@email.com"
-}
-
-```
+A driver is eligible when they are not `offline`, in range of the pickup, and below their delivery limit (Bike 2, other vehicles 1). `back_drivers.status` moves between `available` and `busy` with their load. `offline` is set by the driver app's toggle and is never changed by the backend.
 
 ## 7. Driver Response Handler
 
 ```http
-GET /drivers/driver-response
-
+POST /drivers/driver-response
+Authorization: Bearer <driver's Supabase token>
 ```
 
 ## Description
-This endpoint checks first that a driver account is not actively running more than the allowed ongoing trips and is off the expected vehicle type, if the account passes the constraints the endpoint then takes the driver repsonse payload json, a parameter that is expected to expose response option to the driver frontend app.
+Answers an offer, or taps Start on an assigned delivery. The driver is taken from the token, never the body. Accepting assigns the order in the same transaction (`app_delivery_orders.driver_id`, `status = arriving_pickup`, `delivery_accepted_time`), so a 200 means the order is theirs.
 
-Note: Choosing to handle checks for ongoing trips and vehicle type match is this function might later be found to lead to drivers receiving notifications for trips without option to accept or decline because they do not pass the constraints, with this said it is important to ensure that the ednpoint is not exposed before the notify driver endpoint. 
-
-## Example Driver Response Json
+## Example Body
 ```json
-
-{
-    "driver_response":  { 
-                      "response":  "Accepted",
-                      "response": "Rejected",
-                        } 
-    
-}
-
+{ "offer_id": "uuid-string", "accepted": true }
 ```
+
+## Responses
+- `200` `{ "offer_id": "...", "order_id": 42, "status": "accepted" | "rejected" | "started" }`
+- `404` the offer doesn't exist or belongs to another driver
+- `409` the offer expired or was already answered, the order was taken, the driver is at their limit, or an assigned delivery was declined
 
 
 ## 8. Update Drivers Account
@@ -199,43 +174,31 @@ This function updates the driver_location & driver_reponse fields of its DB stru
 ## 9. Assign Driver Handler
 
 ```http
-GET /riders/assign-driver
-
+POST /riders/assign-driver
 ```
 
 ## Description
-This endpoint checks first that a driver is within required distance of the pick up location and is off the expected vehicle type, if the account passes the constraints the endpoint then creates a channel between the notify-driver handler(alerting the driver frontend app that there is a match) and wait-driver-response(returning the response from Driver_Response_handler via the DriverResponsePayloadOut json).
-The success of this endpoint returns a struct in the form of json type called RideAssignment.
-
-Note: The process will repeat itself 4 times after which it will timeout and the user of the frontend will have to send a new request to proceed.
+Restarts the driver search for an order that already has a ride request, for example after it ended in `no_driver`. Body: `{ "order_ref": "uuid-string" }`. Responds like ride-request below; `409` if a driver already has the order.
 
 
-
-
-## 10. Driver Response Payload Out handler
-
-```http
-GET /riders/driver-response
-
-```
-
-## Description
-This endpoint recieves the json DriverResponsePayloadOut from the driver-response handler that takes the DriverResponsePayload json. the main idea here is recieving the response from the driver frontend after been notified of the ride request and return it back to assign_driver to return ride assigned successfully.
-
-
-## 11. Create Ride Request & store in DB
+## 10. Create Ride Request & start the driver search
 
 ```http
 POST /riders/ride-request
-
 ```
 
 ## Description
-This endpoint creates a new ride request struct in db using new request_ride function that takes a json called CreateRideRequest from the frontend or mobile.
+Stores the ride request against its delivery order (`order_ref` is required and must match an `app_delivery_orders` row), sets the order to `pending`, and starts the driver search in the background. It responds straight away:
+
+```json
+{ "status": "success", "order_id": 42, "estimated_price": 4500, "estimated_arrival": "..." }
+```
+
+The outcome lands on the order: `arriving_pickup` with `driver_id` set once a driver takes it, or `no_driver` if nobody does within 3 minutes. The search offers the closest eligible drivers first, pauses between rounds, and never re-offers a driver who already passed on the order. Retrying with the same `order_ref` reuses the stored request and doesn't start a second search.
 
 
 
-## 12. Create Trip & store in DB
+## 11. Create Trip & store in DB
 
 ```http
 POST /trips/create-trip
@@ -249,7 +212,7 @@ Exposing this endpoint is neccessary for specifying ongoing trips in the rides s
 
 
 
-## 13. Update Trips stored in DB
+## 12. Update Trips stored in DB
 
 ```http
 POST /trips/update-trip
@@ -262,7 +225,7 @@ This function updates the status, end_ts, fare_estimate, fare_lamports fields of
 
 
 
-## 14. Get Trip by Reference
+## 13. Get Trip by Reference
 
 ```http
 GET /trips/get-trip{reference}
@@ -287,7 +250,7 @@ This will be used mostly in escrow.rs & paystack, exposing for the frontend migh
 }
 ```
 
-## 15. Process Geolocation Data
+## 14. Process Geolocation Data
 
 ```http
 POST /matching/process-geolocation
@@ -302,7 +265,7 @@ Note: This is critical as returing inaccurate data to GeoPointRequest struct fro
 
 
 
-## 16. Create Paystack Transcation 
+## 15. Create Paystack Transcation 
 
 ```http
 POST /paystack/create-transaction{reference}
@@ -315,7 +278,7 @@ This endpoint helps us to create paystack transactions that expose payment infor
 
 
 
-## 17. Paystack Payment Confirmation Handler 
+## 16. Paystack Payment Confirmation Handler 
 
 ```http
 POST /escrow/api/paystack/webhook

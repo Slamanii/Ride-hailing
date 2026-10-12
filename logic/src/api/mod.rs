@@ -4,11 +4,14 @@ pub mod admin;
 pub mod riders;
 pub mod drivers;
 pub mod trips;
+pub mod orders;
+pub mod errors;
 
 
 pub fn init(cfg: &mut ServiceConfig) {
     cfg.service(admin::routes())
        .service(riders::routes())
        .service(drivers::routes())
-       .service(trips::routes());
+       .service(trips::routes())
+       .service(orders::routes());
 }

@@ -17,6 +17,7 @@ filter = { only_tables = [
     "^app_locations$",
     "^app_messages$",
     "^app_package_images$",
+    "^app_ride_offers$",
     "^app_riders_current_status$",
     "^app_saved_locations$",
 ] }

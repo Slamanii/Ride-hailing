@@ -1,156 +1,135 @@
-use actix_web::{ web, Scope, HttpResponse,  };
+use actix_web::{ web, Scope, HttpResponse, http::StatusCode };
 use serde::{ Deserialize, Serialize };
 use diesel::prelude::*;
-use serde_json::Value;
+use serde_json::{ json, Value };
 use crate::db::{ DbPool };
-use crate::services::pricing::{ GeoPoint };
 use uuid::Uuid;
-use crate::api::drivers::{ Driver, DriverResponse };
+use crate::api::drivers::Driver;
+use crate::api::errors::{ ApiError, blocking, json_error, message_body };
+use crate::services::auth::{ AuthGuard, AuthUser };
 
-pub async fn admin_dashboard(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
-    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
+pub async fn admin_dashboard(_auth: AuthGuard, pool: web::Data<DbPool>) -> HttpResponse {
+    use crate::schema::back_custom_users::dsl::back_custom_users as riders;
+    use crate::schema::back_drivers::dsl::back_drivers as drivers;
 
-    // Count riders
-    let rider_count = match web::block({
-        let pool = pool.clone();
-        move || -> Result<i64, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            riders.count().get_result(&mut conn).map_err(|e| e.to_string())
-        }
-    }).await {
-        Ok(Ok(count)) => count,
-        Ok(Err(e)) => return HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
-        Err(_) => return HttpResponse::InternalServerError().body("Error counting riders"),
-    };
+    let counts = blocking(&pool, |conn| {
+        let rider_count: i64 = riders.count().get_result(conn)?;
+        let driver_count: i64 = drivers.count().get_result(conn)?;
+        Ok((rider_count, driver_count))
+    }).await;
 
-    // Count drivers
-    let driver_count = match web::block({
-        let pool = pool.clone();
-        move || -> Result<i64, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            drivers.count().get_result(&mut conn).map_err(|e| e.to_string())
-        }
-    }).await {
-        Ok(Ok(count)) => count,
-        Ok(Err(e)) => return HttpResponse::InternalServerError().body(format!("DB error: {}", e)),
-        Err(_) => return HttpResponse::InternalServerError().body("Error counting drivers"),
-    };
-
-    // Return combined JSON
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "Ok",
-        "rider_count": rider_count,
-        "driver_count": driver_count
-    }))
+    match counts {
+        Ok((rider_count, driver_count)) => HttpResponse::Ok().json(json!({
+            "status": "Ok",
+            "rider_count": rider_count,
+            "driver_count": driver_count
+        })),
+        Err(e) => e.response(),
+    }
 }
 
 
+// Called by the app when signup completes. The rider id is the caller's auth.users id.
+// Safe to retry: a second call for the same user is a no-op that still returns 200.
 pub async fn create_rider(
+    auth: AuthUser,
     pool: web::Data<DbPool>,
     body: web::Json<RiderRequest>,
 ) -> HttpResponse {
     use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
 
-    let new_rider = NewRider::new(body.into_inner());
+    let new_rider = NewRider::new(auth.user_id, body.into_inner());
 
-    let result = web::block({
-        let pool = pool.clone();
-        move || -> Result<usize, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            diesel::insert_into(riders)
-                .values(new_rider)
-                .execute(&mut conn)
-                .map_err(|e| e.to_string())
-        }
+    let result = blocking(&pool, move |conn| {
+        diesel::insert_into(riders)
+            .values(new_rider)
+            .on_conflict(rider_id)
+            .do_nothing()
+            .execute(conn)
+            .map_err(signup_db_error)
     }).await;
 
     match result {
-        Ok(Ok(_rows)) => HttpResponse::Ok().json("Rider created"),
-        Ok(Err(db_err)) => HttpResponse::BadRequest().body(format!("DB error: {}", db_err)),
-        Err(block_err) => HttpResponse::InternalServerError().body(format!("Threadpool error: {}", block_err)),
+        Ok(1) => HttpResponse::Ok().json(message_body("Rider created")),
+        Ok(_) => HttpResponse::Ok().json(message_body("Rider already exists")),
+        Err(e) => e.response(),
     }
+}
+
+fn signup_db_error(e: diesel::result::Error) -> ApiError {
+    use diesel::result::{ Error, DatabaseErrorKind };
+    match e {
+        // driver_id/rider_id conflicts are absorbed by on_conflict, so this is the email key
+        Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _) =>
+            ApiError::Conflict("Email is already registered to another account".into()),
+        other => other.into(),
+    }
+}
+
+// No wallets yet: accounts are created without a pubkey. The column is NOT NULL, so this stores
+// the same `{}` placeholder older accounts have; open_trip treats it as no pubkey.
+fn no_pubkey() -> Value {
+    json!({})
 }
 
 pub async fn get_riders(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::back_custom_users::dsl::{back_custom_users as riders, *};
+    use crate::schema::back_custom_users::dsl::back_custom_users as riders;
 
-    let results = web::block({
-        let pool = pool.clone();
-        move || -> Result<Vec<Rider>, String> {
-            let mut connection = pool.get().map_err(|e| e.to_string())?;
-            riders.limit(20)
-                  .select(Rider::as_select())
-                  .load::<Rider>(&mut connection)
-                  .map_err(|e| e.to_string())
-        }
+    let results = blocking(&pool, |conn| {
+        Ok(riders.limit(20).select(Rider::as_select()).load::<Rider>(conn)?)
     }).await;
 
     match results {
-        Ok(Ok(data)) => HttpResponse::Ok().json(data),
-        Ok(Err(db_err)) => {
-            eprintln!("DB error: {:?}", db_err);
-            HttpResponse::InternalServerError().body("Database error")
-        }
-        Err(blocking_err) => {
-            eprintln!("Blocking error: {:?}", blocking_err);
-            HttpResponse::InternalServerError().body("Server busy")
-        }
+        Ok(data) => HttpResponse::Ok().json(data),
+        Err(e) => e.response(),
     }
 }
 
 
+// Called by the app when signup completes. The driver id is the caller's auth.users id.
+// Safe to retry: a second call for the same user is a no-op that still returns 200,
+// so a lost response can't leave the rider stuck on "Setup Not Finished".
 pub async fn create_driver(
+    auth: AuthUser,
     pool: web::Data<DbPool>,
     body: web::Json<DriverRequest>,
 ) -> HttpResponse {
     use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
 
-    let new_driver = NewDriver::new(body.into_inner());
+    let req = body.into_inner();
+    if let Err(msg) = req.validate() {
+        return json_error(StatusCode::BAD_REQUEST, msg);
+    }
 
-    let result = web::block({
-        let pool = pool.clone();
-        move || -> Result<usize, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-            diesel::insert_into(drivers)
-                .values(new_driver)
-                .execute(&mut conn)
-                .map_err(|e| e.to_string())
-        }
+    let new_driver = NewDriver::new(auth.user_id, req);
+
+    let result = blocking(&pool, move |conn| {
+        diesel::insert_into(drivers)
+            .values(new_driver)
+            .on_conflict(driver_id)
+            .do_nothing()
+            .execute(conn)
+            .map_err(signup_db_error)
     }).await;
 
     match result {
-        Ok(Ok(_rows)) => HttpResponse::Ok().json("Driver created"),
-        Ok(Err(db_err)) => HttpResponse::BadRequest().body(format!("DB error: {}", db_err)),
-        Err(block_err) => HttpResponse::InternalServerError().body(format!("Threadpool error: {}", block_err)),
+        Ok(1) => HttpResponse::Ok().json(message_body("Driver created")),
+        Ok(_) => HttpResponse::Ok().json(message_body("Driver already exists")),
+        Err(e) => e.response(),
     }
 }
 
 
 pub async fn get_drivers(pool: web::Data<DbPool>) -> HttpResponse {
-    use crate::schema::back_drivers::dsl::{back_drivers as drivers, *};
+    use crate::schema::back_drivers::dsl::back_drivers as drivers;
 
-    let results = web::block({
-        let pool = pool.clone();
-        move || -> Result<Vec<Driver>, String> {
-            let mut connection = pool.get().map_err(|e| e.to_string())?;
-            drivers.limit(20)
-                   .select(Driver::as_select())
-                   .load::<Driver>(&mut connection)
-                   .map_err(|e| e.to_string())
-        }
+    let results = blocking(&pool, |conn| {
+        Ok(drivers.limit(20).select(Driver::as_select()).load::<Driver>(conn)?)
     }).await;
 
     match results {
-        Ok(Ok(data)) => HttpResponse::Ok().json(data),
-        Ok(Err(db_err)) => {
-            eprintln!("DB error: {:?}", db_err);
-            HttpResponse::InternalServerError().body("Database error")
-        }
-        Err(blocking_err) => {
-            eprintln!("Blocking error: {:?}", blocking_err);
-            HttpResponse::InternalServerError().body("Server busy")
-        }
+        Ok(data) => HttpResponse::Ok().json(data),
+        Err(e) => e.response(),
     }
 }
 
@@ -170,7 +149,6 @@ pub struct RiderRequest {
     pub name: String,
     pub email: String,
     pub phone: String,
-    pub rider_pubkey: String,
 }
 
 #[derive(Queryable, Serialize, Deserialize, Selectable, Clone)]
@@ -196,10 +174,10 @@ pub struct NewRider {
 }
 
 impl NewRider {
-    pub fn new(req: RiderRequest) -> Self {
+    pub fn new(user_id: Uuid, req: RiderRequest) -> Self {
         Self {
-            rider_id: Uuid::new_v4(),
-            rider_pubkey: serde_json::to_value(&req.rider_pubkey).expect("serialize pubkey"),
+            rider_id: user_id,
+            rider_pubkey: no_pubkey(),
             name: req.name,
             email: req.email,
             phone: req.phone,
@@ -213,12 +191,24 @@ pub struct DriverRequest {
     pub name: String,
     pub email: String,
     pub phone: String,
-    pub driver_pubkey: String,
     pub license_number: Option<String>,
     pub vehicle_type: String,
     pub vehicle: Option<String>,
     pub account_number: Option<String>,
     pub bank_code: Option<String>,
+}
+
+impl DriverRequest {
+    // The app sends exactly "Bike" or "EV"; EVs must also carry vehicle and licence details.
+    fn validate(&self) -> Result<(), String> {
+        let present = |v: &Option<String>| v.as_deref().map_or(false, |s| !s.trim().is_empty());
+        match self.vehicle_type.as_str() {
+            "Bike" => Ok(()),
+            "EV" if present(&self.vehicle) && present(&self.license_number) => Ok(()),
+            "EV" => Err("EV drivers must provide vehicle and license_number".into()),
+            other => Err(format!("Unknown vehicle_type '{}', expected \"Bike\" or \"EV\"", other)),
+        }
+    }
 }
 
 #[derive(Insertable, Deserialize, Clone)]
@@ -240,18 +230,19 @@ pub struct NewDriver {
 }
 
 impl NewDriver {
-    pub fn new(req: DriverRequest) -> Self {
+    pub fn new(user_id: Uuid, req: DriverRequest) -> Self {
         Self {
-            driver_id: Uuid::new_v4(),
-            driver_pubkey: serde_json::to_value(&req.driver_pubkey).expect("serialize pubkey"),
+            driver_id: user_id,
+            driver_pubkey: no_pubkey(),
             name: req.name,
             email: req.email,
             phone: req.phone,
             status: "available".to_string(),
-            driver_location: serde_json::to_value(GeoPoint { lat: 0.0, lng: 0.0, name: Some("Earth".to_string()) }).expect("serialize geo"),
+            // Same shapes as GeoPoint and DriverResponse::Timeout serialize to.
+            driver_location: json!({ "lat": 0.0, "lng": 0.0, "name": "Earth" }),
             license_number: req.license_number,
             vehicle_type: req.vehicle_type,
-            driver_response: serde_json::to_value(DriverResponse::Timeout).expect("serialize driver response"),
+            driver_response: json!("Timeout"),
             vehicle: req.vehicle,
             account_number: req.account_number,
             bank_code: req.bank_code,

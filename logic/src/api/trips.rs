@@ -1,180 +1,70 @@
 use actix_web::{ web, HttpResponse, Scope };
-use crate::services::auth::AuthGuard;
+use crate::services::auth::AuthUser;
 use serde::{ Deserialize, Serialize };
-use serde_json::Value;
 use uuid::Uuid;
 use diesel::prelude::*;
 use chrono::Utc;
 use sha2::{Sha256, Digest};
-use crate::schema::back_trips::dsl::{back_trips as trips, *};
 use crate::api::drivers::Driver;
 use crate::api::riders::{ RideRequest };
 use crate::api::admin::Rider;
+use crate::api::errors::{ ApiError, blocking };
 use crate::db::DbPool;
 use diesel::pg::PgConnection;
 
+// Trips are written only by the order flow (orders::open_trip, await_payout, close_trip):
+// their status drives the driver payout, so no client route creates or updates them.
 
-
-
-pub async fn create_trip(
-    pool: web::Data<DbPool>,
-    body: web::Json<CreateTripInput>
-) -> HttpResponse {
-    
-    let trip = body.into_inner();
-
-    let result = web::block({
-
-        let pool = pool.clone();
-        move || {
-
-            let mut conn = pool.get().expect("Failed to get connection");
-
-    
-
-        diesel::insert_into(trips)
-            .values((
-                trip_id.eq(trip.trip_id), // [u8; 32] as bytes
-                rider_id.eq(trip.rider_id), // UUID
-                reference.eq(trip.reference),
-                status.eq("ongoing"),
-                pick_up.eq(trip.pick_up), 
-                drop_off.eq(trip.drop_off), 
-                driver_location.eq(trip.driver_location), 
-                rider_pubkey.eq(trip.rider_pubkey), // Pubkey as string
-                driver_pubkey.eq(trip.driver_pubkey), // Pubkey as string
-                driver_id.eq(trip.driver_id),
-                start_ts.eq(trip.start_ts),
-                end_ts.eq(trip.end_ts),
-                item.eq(trip.item), // JSONB
-                distance_km.eq(trip.distance_km),
-                fare_estimate.eq(trip.fare_estimate),
-                fare_lamports.eq(trip.fare_lamports),
-                rider_email.eq(trip.rider_email),
-
-            ))
-            .execute(&mut conn).map(|e| e.to_string());
-        }
-    })
-    .await;
-
-    match result {
-        Ok(_) => HttpResponse::Ok().body("Trip created"),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error: {}", e)),
-    }
-}
-
-
-
-pub async fn update_trip(
-    _auth: AuthGuard,
-    pool: web::Data<DbPool>,
-    rider_uuid: web::Path<Uuid>,
-    body: web::Json<Trip>,
-) -> HttpResponse {
-    use crate::schema::back_trips::dsl::{back_trips as trips, *};
-
-    let rider_id_val = rider_uuid.into_inner();
-    let trip = body.into_inner();
-
-    let result = web::block({
-        let pool = pool.clone();
-
-        move || -> Result<usize, String> {
-            let mut conn = pool.get().map_err(|e| e.to_string())?;
-
-            diesel::update(trips.filter(rider_id.eq(rider_id_val)))
-                .set((
-                    status.eq(trip.status),
-                    end_ts.eq(trip.end_ts),
-                    fare_estimate.eq(trip.fare_estimate),
-                    fare_lamports.eq(trip.fare_lamports),
-                ))
-                .execute(&mut conn)
-                .map_err(|e| e.to_string())
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Ok(rows)) if rows > 0 => HttpResponse::Ok().json(rows),
-
-        Ok(Ok(_)) => HttpResponse::Ok().body("No rows updated"),
-
-        Ok(Err(db_err)) => {
-            HttpResponse::InternalServerError().body(format!("DB error: {}", db_err))
-        }
-
-        Err(block_err) => {
-            HttpResponse::InternalServerError()
-                .body(format!("Blocking error: {}", block_err))
-        }
-    }
-}
-
-
+// The rider or the driver of the trip; anyone else gets the same 404 as a missing trip.
 pub async fn get_trip(
-    _auth: AuthGuard,
+    auth: AuthUser,
     pool: web::Data<DbPool>,
     path: web::Path<String>,
 ) -> HttpResponse {
+    let me = auth.user_id;
     let reference_value = path.into_inner();
 
-    let result = web::block({
-        let pool = pool.clone();
-        move || {
-            let mut conn = pool.get().expect("Failed to get connection");
-            get_trip_by_reference(&mut conn, &reference_value)
-        }
-    })
-    .await;
+    let result = blocking(&pool, move |conn| {
+        get_trip_by_reference(conn, &reference_value)?
+            .filter(|trip| trip.rider_id == me || trip.driver_id == me)
+            .ok_or_else(|| ApiError::NotFound("Trip not found".into()))
+    }).await;
 
     match result {
-        Ok(Ok(trip)) => HttpResponse::Ok().json(trip),
-
-        Ok(Err(diesel::result::Error::NotFound)) => {
-            HttpResponse::NotFound().body("Trip not found")
-        }
-
-        Ok(Err(e)) => {
-            eprintln!("DB error: {:?}", e);
-            HttpResponse::InternalServerError().body("Database error")
-        }
-
-        Err(e) => {
-            eprintln!("Blocking error: {:?}", e);
-            HttpResponse::InternalServerError().body("Server error")
-        }
+        Ok(trip) => HttpResponse::Ok().json(trip),
+        Err(e) => e.response(),
     }
 }
 
-// in riders.rs
-pub fn get_trip_by_reference(conn: &mut PgConnection, ref_str: &str) -> QueryResult<Trip> {
-    use crate::schema::back_trips::dsl::{back_trips as trips, *};
+pub fn get_trip_by_reference(conn: &mut PgConnection, ref_str: &str) -> QueryResult<Option<Trip>> {
+    use crate::schema::back_trips::dsl::*;
 
+    back_trips.filter(reference.eq(ref_str))
+        .select(Trip::as_select())
+        .first::<Trip>(conn)
+        .optional()
+}
 
-    trips.filter(reference.eq(ref_str))
-         .select(Trip::as_select())
-         .first::<Trip>(conn)
+pub fn get_trip_by_order_ref(conn: &mut PgConnection, order_ref_val: Uuid) -> QueryResult<Option<Trip>> {
+    use crate::schema::back_trips::dsl::*;
+
+    back_trips.filter(order_ref.eq(order_ref_val))
+        .select(Trip::as_select())
+        .first::<Trip>(conn)
+        .optional()
 }
 
 
-
-
-
-// from escrow .rs or to escrow.rs
-
-#[derive(Insertable, Deserialize, Clone)]
-#[diesel(table_name = crate::schema::back_trips)]
-struct CreateTripInput {
+#[derive(Deserialize, Clone)]
+pub struct CreateTripInput {
     pub trip_id: [u8; 32],
     pub rider_id: Uuid,
     pub reference: String,
     pub pick_up: serde_json::Value,
     pub drop_off: serde_json::Value,
     pub driver_location: serde_json::Value,
-    pub rider_pubkey: String,
-    pub driver_pubkey: String,
+    pub rider_pubkey: Option<String>,
+    pub driver_pubkey: Option<String>,
     pub driver_id: Uuid,
     pub status: String,
     pub start_ts: i64,
@@ -186,19 +76,11 @@ struct CreateTripInput {
     pub order_ref: Option<Uuid>,
     pub rider_email: String,
 }
-//you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
 impl CreateTripInput {
 
     pub fn new(drv: Driver, rdr: Rider, req2: RideRequest) -> Self {
-        
-        let start_ts_value = Utc::now().timestamp() as i64;
-        let mut hasher = Sha256::new();
-            hasher.update(Uuid::new_v4().as_bytes());
-
-            let trip_id_bytes: [u8; 32] = hasher.finalize().as_slice().try_into().unwrap();
-
-       
+        let trip_id_bytes: [u8; 32] = Sha256::digest(Uuid::new_v4().as_bytes()).into();
 
         Self {
             trip_id: trip_id_bytes,
@@ -207,11 +89,11 @@ impl CreateTripInput {
             pick_up: req2.pick_up.clone(),
             drop_off: req2.drop_off.clone(),
             driver_location: drv.driver_location.clone(),
-            rider_pubkey: rdr.rider_pubkey.to_string(),
-            driver_pubkey: drv.driver_pubkey.to_string(),
+            rider_pubkey: rdr.rider_pubkey.as_str().map(str::to_string),
+            driver_pubkey: drv.driver_pubkey.as_str().map(str::to_string),
             driver_id: drv.driver_id,
             status: "Ongoing".to_string(),
-            start_ts: start_ts_value,
+            start_ts: Utc::now().timestamp(),
             end_ts: None,
             distance_km: req2.distance_km,
             item: req2.items.clone(),
@@ -236,8 +118,9 @@ pub struct Trip {
     pub drop_off: serde_json::Value,
 #[diesel(sql_type = diesel::sql_types::Jsonb)]
     pub driver_location: serde_json::Value,
-    pub rider_pubkey: String,
-    pub driver_pubkey: String,
+    // NULL until riders and drivers have real wallets.
+    pub rider_pubkey: Option<String>,
+    pub driver_pubkey: Option<String>,
     pub driver_id: Uuid,
     pub status: String,
     pub start_ts: i64,
@@ -250,35 +133,26 @@ pub struct Trip {
     pub order_ref: Option<Uuid>,
     pub rider_email: String,
 }
-//you havent implemented trip( pull from riders, drivers & admin) ------- maybe this should be from db as well who knows remember to check it
 
 impl Trip {
-
 
     pub fn update_status(&mut self) {
         if self.driver_location == self.drop_off {
             self.status = "Completed".to_string();
-            self.end_ts = Some(Utc::now().timestamp() as i64);
+            self.end_ts = Some(Utc::now().timestamp());
         }
     }
-   
+
     pub fn compute_fare_lamports(&mut self) {
         if let Some(estimate) = self.fare_estimate {
-            
             let lamports_per_ngn: f64 = 128.0;
-
             self.fare_lamports = Some((estimate as f64 * lamports_per_ngn) as i64);
         }
     }
 }
 
 
-
-
 pub fn routes() -> Scope {
     web::scope("/trips")
-        .route("/create-trip", web::post().to(create_trip))
-        .route("/update-trip", web::post().to(update_trip))
         .route("/get-trip/{reference}", web::get().to(get_trip))
 }
-

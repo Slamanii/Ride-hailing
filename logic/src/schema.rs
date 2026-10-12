@@ -62,6 +62,8 @@ diesel::table! {
         payment_reference -> Nullable<Text>,
         cancelled_at -> Nullable<Timestamptz>,
         cancelled_by -> Nullable<Uuid>,
+        order_ref -> Nullable<Uuid>,
+        price -> Nullable<Numeric>,
     }
 }
 
@@ -104,6 +106,18 @@ diesel::table! {
         created_at -> Timestamptz,
         url -> Text,
         user_id -> Uuid,
+    }
+}
+
+diesel::table! {
+    app_ride_offers (id) {
+        id -> Uuid,
+        order_id -> Int8,
+        driver_id -> Uuid,
+        status -> Text,
+        created_at -> Timestamptz,
+        expires_at -> Timestamptz,
+        responded_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -158,6 +172,7 @@ diesel::table! {
         account_number -> Nullable<Text>,
         bank_code -> Nullable<Text>,
         tier -> Nullable<Text>,
+        location_updated_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -177,6 +192,7 @@ diesel::table! {
         user_id -> Nullable<Int8>,
         user_phone_number -> Nullable<Text>,
         vendor_phone_number -> Nullable<Text>,
+        search_attempts -> Int4,
     }
 }
 
@@ -188,8 +204,8 @@ diesel::table! {
         pick_up -> Jsonb,
         drop_off -> Jsonb,
         driver_location -> Jsonb,
-        rider_pubkey -> Text,
-        driver_pubkey -> Text,
+        rider_pubkey -> Nullable<Text>,
+        driver_pubkey -> Nullable<Text>,
         driver_id -> Uuid,
         status -> Text,
         start_ts -> Int8,
@@ -205,6 +221,7 @@ diesel::table! {
 
 diesel::joinable!(app_delivery_orders_waypoints -> app_delivery_orders (order_id));
 diesel::joinable!(app_messages -> app_delivery_orders (delivery_order_id));
+diesel::joinable!(app_ride_offers -> app_delivery_orders (order_id));
 diesel::joinable!(back_trips -> back_drivers (driver_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
@@ -214,6 +231,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     app_locations,
     app_messages,
     app_package_images,
+    app_ride_offers,
     app_riders_current_status,
     app_saved_locations,
     back_custom_users,
