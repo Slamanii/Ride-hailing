@@ -14,6 +14,7 @@ use crate::api::orders::{ OrderKey, OrderRow, cancel_unpaid, close_trip, load_or
 use crate::api::riders::{ RideType, OrderSource, quote, same_place, validate_points, validate_rider_account };
 use crate::services::auth::AuthUser;
 use crate::services::{ codes, escrow };
+use crate::services::areas::require_service_area;
 use crate::services::pricing::GeoPoint;
 
 // Korapay merchant API, amounts in naira (major units), currency NGN.
@@ -167,7 +168,9 @@ pub async fn initialize(
     }
 
     let order_ref = req.order_ref;
+    let (pick_up, drop_off) = (req.pick_up.clone(), req.drop_off.clone());
     let loaded = blocking(&pool, move |conn| {
+        require_service_area(conn, &pick_up, &drop_off)?;
         let order = payable_order(conn, order_ref, me)?;
         let rider = validate_rider_account(conn, me)
             .map_err(|_| ApiError::BadRequest("No rider account for this user".into()))?;
@@ -856,6 +859,69 @@ pub fn spawn_stale_order_sweep(pool: web::Data<DbPool>) {
             sweep_payouts(&pool).await;
         }
     });
+}
+
+// ---------- Banks ----------
+
+#[derive(Deserialize, Serialize, Clone)]
+pub struct Bank {
+    pub name: String,
+    // Korapay's bank code: what a driver saves through update-bank-details and payouts send to.
+    pub code: String,
+}
+
+const BANKS_CACHE_SECS: u64 = 24 * 60 * 60;
+
+lazy_static::lazy_static! {
+    static ref BANKS_CACHE: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Bank>)>> =
+        tokio::sync::Mutex::new(None);
+}
+
+// Korapay documents this lookup with the public key; the secret key is used when none is set.
+async fn fetch_banks() -> Result<Vec<Bank>, String> {
+    let base = base_url()?;
+    let key = env_required("KORAPAY_PUBLIC_KEY").or_else(|_| secret_key())?;
+    let resp = client()?
+        .get(format!("{}/misc/banks", base))
+        .query(&[("countryCode", "NG")])
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Korapay: {}", e))?;
+    let (status, envelope) = read_envelope::<Vec<Bank>>(resp).await?;
+    match envelope.data {
+        Some(banks) if envelope.status && status.is_success() && !banks.is_empty() => Ok(banks),
+        _ => Err(format!("Korapay refused the bank list ({}): {}", status, envelope.message.unwrap_or_default())),
+    }
+}
+
+// Nigerian banks for the driver's bank details form, as [{name, code}]. Public: the list is the
+// same for everyone. Cached for a day; if Korapay is down, a stale list is served over none.
+pub async fn list_banks() -> HttpResponse {
+    let mut cache = BANKS_CACHE.lock().await;
+    if let Some((at, banks)) = cache.as_ref() {
+        if at.elapsed() < Duration::from_secs(BANKS_CACHE_SECS) {
+            return HttpResponse::Ok().json(banks);
+        }
+    }
+    match fetch_banks().await {
+        Ok(banks) => {
+            *cache = Some((std::time::Instant::now(), banks.clone()));
+            HttpResponse::Ok().json(banks)
+        }
+        Err(e) => match cache.as_ref() {
+            Some((_, banks)) => {
+                eprintln!("Bank list refresh failed, serving the cached one: {}", e);
+                HttpResponse::Ok().json(banks)
+            }
+            None => ApiError::BadGateway(format!("Could not load banks: {}", e)).response(),
+        },
+    }
+}
+
+// Its own resource rather than a /payments scope, which would shadow /payments/korapay.
+pub fn banks_route() -> actix_web::Resource {
+    web::resource("/payments/banks").route(web::get().to(list_banks))
 }
 
 pub fn routes() -> Scope {

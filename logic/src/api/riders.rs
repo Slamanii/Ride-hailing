@@ -21,6 +21,7 @@ use crate::services::pricing;
 use crate::services::phone::normalize_phone;
 use crate::services::korapay::{ self, RefundOutcome };
 use crate::services::zazu;
+use crate::services::areas::require_service_area;
 use crate::services::notifications::calculate_eta;
 use crate::api::drivers::{ Driver, NewRideOffer, AssignOutcome, assign_order, max_active_orders, refresh_driver_status, returning_counts };
 use crate::services::auth::{ AnyAuthGuard, Caller };
@@ -663,11 +664,16 @@ pub fn quote(pick_up: &GeoPoint, drop_off: &GeoPoint, ride_type: &RideType) -> R
 // The app's quote screen: price and time for every ride type, used to build the ride request.
 pub async fn ride_quote(
     _auth: AnyAuthGuard,
+    pool: web::Data<DbPool>,
     body: web::Json<QuoteRequest>,
 ) -> HttpResponse {
     let QuoteRequest { pick_up, drop_off } = body.into_inner();
     if let Err(msg) = validate_points(&pick_up, &drop_off) {
         return json_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let (pick, drop) = (pick_up.clone(), drop_off.clone());
+    if let Err(e) = blocking(&pool, move |conn| require_service_area(conn, &pick, &drop)).await {
+        return e.response();
     }
     let quotes: Vec<RideQuote> = [RideType::ASAP, RideType::ASAPEXPRESS]
         .iter()
@@ -723,6 +729,11 @@ pub async fn request_ride(
     let mut req = body.into_inner();
     if let Err(msg) = req.validate() {
         return json_error(StatusCode::BAD_REQUEST, msg);
+    }
+    // App and Zazu orders alike.
+    let (pick, drop) = (req.pick_up.clone(), req.drop_off.clone());
+    if let Err(e) = blocking(&pool, move |conn| require_service_area(conn, &pick, &drop)).await {
+        return e.response();
     }
 
     let source = req.source.unwrap_or(match caller {
