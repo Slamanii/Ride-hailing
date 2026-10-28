@@ -202,6 +202,8 @@ pub async fn update_driver_status(
             if wanted == "available" {
                 refresh_driver_status(conn, me)?;
             }
+            // Online time (services::sessions).
+            crate::services::sessions::record_status(conn, me, &wanted);
 
             Ok(d::back_drivers.find(me).select(d::status).first::<String>(conn)?)
         })
@@ -396,8 +398,8 @@ pub async fn preflight_check(
     };
 
     let vehicle_filter: Vec<String> = match req.ride_type {
-        RideType::ASAP => vec!["EV".to_string()],
-        RideType::ASAPEXPRESS => vec!["Bike".to_string()],
+        RideType::ASAP => vec!["Bike".to_string()],
+        RideType::ASAPEXPRESS => vec!["EV".to_string()],
     };
 
     for _ in 0..MAX_RETRIES {
@@ -524,13 +526,17 @@ struct ZazuOrderDetails {
     dropoff_code: Option<String>,
     #[diesel(sql_type = Nullable<Text>)]
     customer_phone: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    asset_trip: bool,
 }
 
 // Tells Zazu who is carrying one of its orders, once a driver has taken it. Zazu writes this
 // to telegram_orders and passes the codes on: the sender gives the pickup code to the driver,
 // the receiver the drop-off code. Zazu runs no pickup or drop-off step itself; the driver app
 // enters both codes here (confirm-pickup, confirm-dropoff). The driver's bank details go along
-// because Zazu pays its own drivers.
+// because Zazu pays its own drivers. asset_trip / driver_share_bps say how much of the fare is
+// theirs: a driver on an investor-funded vehicle gets 55% instead of 85% (the same check
+// open_trip uses to stamp back_trips.asset_id).
 // Runs after the driver's answer is committed. App orders are skipped. Sent again if the order
 // is re-assigned, so Zazu should treat it as an upsert keyed by order_ref.
 pub async fn forward_ride_details_to_zazu(pool: web::Data<DbPool>, order_id: i64, driver_uuid: Uuid) {
@@ -540,10 +546,14 @@ pub async fn forward_ride_details_to_zazu(pool: web::Data<DbPool>, order_id: i64
                 pickup_lat::float8 AS pickup_lat, pickup_long::float8 AS pickup_long, pickup_name, \
                 pickup_contact_name, pickup_contact_phone, pickup_code, \
                 dropoff_lat::float8 AS dropoff_lat, dropoff_long::float8 AS dropoff_long, dropoff_name, \
-                dropoff_code, customer_phone \
+                dropoff_code, customer_phone, \
+                EXISTS (SELECT 1 FROM asset_assignments aa \
+                          JOIN invest_assets ia ON ia.id = aa.asset_id AND ia.status = 'active' \
+                         WHERE aa.driver_id = $2 AND aa.ended_at IS NULL) AS asset_trip \
              FROM app_delivery_orders WHERE id = $1 AND lower(source) = 'zazu'"
         )
         .bind::<BigInt, _>(order_id)
+        .bind::<SqlUuid, _>(driver_uuid)
         .get_result(conn)
         .optional()?;
         let Some(order) = order else { return Ok(None) };
@@ -572,6 +582,8 @@ pub async fn forward_ride_details_to_zazu(pool: web::Data<DbPool>, order_id: i64
         "order_ref":  order.order_ref,
         "order_code": order.order_code,
         "status":     order.status,
+        "asset_trip": order.asset_trip,
+        "driver_share_bps": crate::services::korapay::driver_share_bps(order.asset_trip),
         "pick_up": {
             "lat":           order.pickup_lat,
             "lng":           order.pickup_long,
@@ -612,7 +624,7 @@ pub async fn forward_ride_details_to_zazu(pool: web::Data<DbPool>, order_id: i64
 // of one order never equal each other (codes::code_pair, confirmation_code_except).
 
 // The order the signed-in driver is carrying.
-fn drivers_order(conn: &mut PgConnection, order_ref: &str, me: Uuid, lock: bool) -> Result<OrderRow, ApiError> {
+pub(crate) fn drivers_order(conn: &mut PgConnection, order_ref: &str, me: Uuid, lock: bool) -> Result<OrderRow, ApiError> {
     load_order(conn, OrderKey::parse(order_ref), lock)?
         .filter(|order| order.driver_id == Some(me))
         .ok_or_else(|| ApiError::NotFound("No order of yours for this order_ref".into()))
@@ -629,7 +641,7 @@ fn check_code(expected: Option<&str>, sent: Option<&str>, what: &str) -> Result<
 }
 
 // The driver has to be at `place` (within riders::SAME_PLACE_KM) by their last reported location.
-fn require_near(conn: &mut PgConnection, driver_uuid: Uuid, place: Option<GeoPoint>, what: &str) -> Result<(), ApiError> {
+pub(crate) fn require_near(conn: &mut PgConnection, driver_uuid: Uuid, place: Option<GeoPoint>, what: &str) -> Result<(), ApiError> {
     use crate::schema::back_drivers::dsl as d;
 
     let location: serde_json::Value = d::back_drivers
@@ -874,6 +886,9 @@ pub fn routes() -> Scope {
         .route("/confirm-dropoff", web::post().to(confirm_dropoff))
         .route("/confirm-return", web::post().to(confirm_return))
         .route("/register-zazu-url", web::post().to(register_zazu_url))
+        // Applying to ride an ASAP vehicle; the applicant isn't a driver yet.
+        .route("/applications", web::post().to(crate::api::applications::submit_application))
+        .route("/report-package-issue", web::post().to(crate::api::disputes::report_package_issue))
 }
 
 #[derive(Deserialize)]
@@ -939,8 +954,8 @@ impl Driver {
 
     fn allowed_vehicle_types(&self, ride_type: &RideType) -> Vec<String> {
         match ride_type {
-            RideType::ASAP => vec!["EV".to_string()],
-            RideType::ASAPEXPRESS => vec!["Bike".to_string()],
+            RideType::ASAP => vec!["Bike".to_string()],
+            RideType::ASAPEXPRESS => vec!["EV".to_string()],
         }
     }
 

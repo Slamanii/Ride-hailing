@@ -11,10 +11,13 @@ pub mod phone;
 pub mod korapay;
 pub mod zazu;
 pub mod areas;
+pub mod invest;
+pub mod sessions;
 
 pub fn init(cfg: &mut ServiceConfig) {
     cfg.service(matching::routes())
        .service(areas::routes())
+       .service(invest::routes())
        .service(paystack::routes())
        .service(korapay::routes())
        .service(korapay::banks_route());

@@ -10,6 +10,7 @@ default-run = "logic"
 # Web framework
 actix-web = "4"            # HTTP server & routing
 actix-rt = "2"             # Async runtime for Actix
+actix-cors = "0.7"         # Lets the website (a browser) call the API
 ts-rs = "10"
 
 
@@ -43,6 +44,7 @@ jsonwebtoken = "9"
 anchor-spl = "0.32.1"
 hex = "0.4.3"
 anyhow = "1.0.100"
+argon2 = "0.5"             # investor withdrawal PIN hashes
 
 
 

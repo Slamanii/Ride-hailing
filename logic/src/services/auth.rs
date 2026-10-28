@@ -1,10 +1,13 @@
-use actix_web::{ HttpRequest, FromRequest, dev::Payload };
-use std::future::{ ready, Ready };
+use actix_web::{ web, HttpRequest, FromRequest, dev::Payload };
+use std::future::{ ready, Future, Ready };
+use std::pin::Pin;
 use std::env;
-use serde::Deserialize;
+use diesel::prelude::*;
+use serde::{ Deserialize, Serialize };
 use uuid::Uuid;
 use actix_web::http::StatusCode;
-use crate::api::errors::json_extractor_error;
+use crate::api::errors::{ blocking, json_extractor_error };
+use crate::db::DbPool;
 
 fn unauthorized() -> actix_web::Error {
     json_extractor_error(StatusCode::UNAUTHORIZED, "Unauthorized")
@@ -117,6 +120,60 @@ impl FromRequest for AnyAuthGuard {
         } else {
             ready(Err(unauthorized()))
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminRole {
+    // The one account that grants and revokes admins; changed only in the DB or in code.
+    Superior,
+    Admin,
+}
+
+/// Requires a valid Supabase JWT whose user is in back_admins (403 otherwise): the admin
+/// endpoints and dashboard.
+pub struct AdminUser {
+    pub user_id: Uuid,
+    pub role: AdminRole,
+}
+
+impl AdminUser {
+    pub fn is_superior(&self) -> bool {
+        self.role == AdminRole::Superior
+    }
+}
+
+#[derive(QueryableByName)]
+struct AdminRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    role: String,
+}
+
+impl FromRequest for AdminUser {
+    type Error = actix_web::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self, Self::Error>>>>;
+
+    fn from_request(req: &HttpRequest, _: &mut Payload) -> Self::Future {
+        let user = bearer_claims(req).and_then(|c| Uuid::parse_str(&c.sub).ok());
+        let pool = req.app_data::<web::Data<DbPool>>().cloned();
+
+        Box::pin(async move {
+            let user_id = user.ok_or_else(unauthorized)?;
+            let pool = pool.ok_or_else(|| json_extractor_error(StatusCode::INTERNAL_SERVER_ERROR, "No database"))?;
+            let row = blocking(&pool, move |conn| Ok(diesel::sql_query("SELECT role FROM back_admins WHERE user_id = $1")
+                .bind::<diesel::sql_types::Uuid, _>(user_id)
+                .get_result::<AdminRow>(conn)
+                .optional()?))
+                .await
+                .map_err(|e| json_extractor_error(StatusCode::INTERNAL_SERVER_ERROR, e.message()))?;
+            let role = match row.as_ref().map(|r| r.role.as_str()) {
+                Some("superior") => AdminRole::Superior,
+                Some("admin") => AdminRole::Admin,
+                _ => return Err(json_extractor_error(StatusCode::FORBIDDEN, "Admins only")),
+            };
+            Ok(AdminUser { user_id, role })
+        })
     }
 }
 

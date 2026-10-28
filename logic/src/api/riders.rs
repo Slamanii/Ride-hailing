@@ -41,18 +41,25 @@ lazy_static! {
 const OFFER_TTL_SECS: u64 = 50;
 // How long an assigned driver has to tap Start before the order is taken back.
 const ASSIGNED_START_SECS: u64 = 60;
-// The customer app gives up after 3 minutes (SEARCH_TIMEOUT_MS).
-const SEARCH_WINDOW_SECS: u64 = 180;
+// How long a search runs before the order is marked no_driver. The customer app's
+// SEARCH_TIMEOUT_MS should wait at least this long.
+const SEARCH_WINDOW_SECS: u64 = 1800;
 // Pause between rounds, so an empty area doesn't burn through the search in seconds.
 const ROUND_PAUSE_SECS: u64 = 7;
 const DRIVERS_PER_ROUND: usize = 10;
-// How far from the pickup drivers are looked for, by search attempt: the first search, then
-// each Try again after no_driver. Later attempts stay at the widest.
+// How far from the pickup drivers are looked for. A search starts at the step for its attempt
+// (the first search, then each Try again after no_driver) and moves out one step every
+// RADIUS_STEP_SECS while it runs, staying at the widest. App and Zazu orders alike.
 const SEARCH_RADIUS_KM: [f64; 3] = [5.0, 8.0, 12.0];
+const RADIUS_STEP_SECS: u64 = 180;
+// A driver who declined or let an offer lapse is offered the same order again after this,
+// if they're still free and in range.
+const RETRY_DRIVER_AFTER_MINS: u32 = 10;
 
-fn search_radius_km(attempt: i32) -> f64 {
-    let index = (attempt.max(1) as usize - 1).min(SEARCH_RADIUS_KM.len() - 1);
-    SEARCH_RADIUS_KM[index]
+fn search_radius_km(attempt: i32, elapsed_secs: u64) -> f64 {
+    let start = attempt.max(1) as usize - 1;
+    let steps = (elapsed_secs / RADIUS_STEP_SECS) as usize;
+    SEARCH_RADIUS_KM[(start + steps).min(SEARCH_RADIUS_KM.len() - 1)]
 }
 
 // delivery_status is a Postgres enum; only fixed literals are passed here, never user input.
@@ -164,13 +171,77 @@ impl Drop for SearchGuard {
 
 // Starts the background search unless one is already running for the order.
 pub fn start_search(pool: web::Data<DbPool>, order_id: i64) {
+    spawn_search(pool, order_id, None);
+}
+
+// `resume`: how long this order has already been searching (see sweep_orphaned_searches);
+// None for a new search, which also counts as an attempt.
+fn spawn_search(pool: web::Data<DbPool>, order_id: i64, resume: Option<u64>) -> bool {
     if !ACTIVE_SEARCHES.lock().unwrap_or_else(|e| e.into_inner()).insert(order_id) {
-        return;
+        return false;
     }
     let guard = SearchGuard(order_id);
     tokio::spawn(async move {
         let _guard = guard;
-        run_assign_driver(pool, order_id).await;
+        run_assign_driver(pool, order_id, resume).await;
+    });
+    true
+}
+
+// ---------- Orphaned-search sweep ----------
+//
+// A search lives in this server's memory, so a restart (or a crash) leaves its order pending
+// with nothing looking for a driver. The sweep finds pending orders with no driver and no
+// search running here and resumes them: not a new attempt, at the radius already reached, for
+// what's left of SEARCH_WINDOW_SECS (an order already past it is marked no_driver at once).
+// The time searched so far is measured from modified_at, set when the order went pending.
+// Assumes one server instance: a second instance would see the first's searches as orphaned.
+
+const SEARCH_SWEEP_EVERY_SECS: u64 = 60;
+// Leaves alone an order that just went pending, whose request is still starting its search.
+const ORPHAN_AFTER_SECS: i32 = 60;
+
+#[derive(QueryableByName)]
+struct PendingOrder {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    searched_secs: i64,
+}
+
+fn pending_without_driver(connection: &mut PgConnection) -> QueryResult<Vec<PendingOrder>> {
+    diesel::sql_query(
+        "SELECT o.id, extract(epoch FROM now() - o.modified_at)::int8 AS searched_secs \
+           FROM app_delivery_orders o \
+          WHERE o.status = 'pending' AND o.driver_id IS NULL \
+            AND o.modified_at < now() - make_interval(secs => $1) \
+            AND EXISTS (SELECT 1 FROM back_ride_request r WHERE r.order_ref = o.order_ref) \
+          ORDER BY o.modified_at \
+          LIMIT 200"
+    )
+    .bind::<diesel::sql_types::Integer, _>(ORPHAN_AFTER_SECS)
+    .load(connection)
+}
+
+async fn sweep_orphaned_searches(pool: &web::Data<DbPool>) {
+    let pending = match with_conn(pool, |conn| pending_without_driver(conn).map_err(|e| e.to_string())).await {
+        Ok(pending) => pending,
+        Err(e) => return eprintln!("Search sweep: could not load pending orders: {}", e),
+    };
+    for order in pending {
+        if spawn_search(pool.clone(), order.id, Some(order.searched_secs.max(0) as u64)) {
+            println!("Search sweep: order {} had no search running ({}s in); resumed", order.id, order.searched_secs);
+        }
+    }
+}
+
+pub fn spawn_search_sweep(pool: web::Data<DbPool>) {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_secs(SEARCH_SWEEP_EVERY_SECS));
+        loop {
+            ticks.tick().await;
+            sweep_orphaned_searches(&pool).await;
+        }
     });
 }
 
@@ -252,14 +323,13 @@ struct SearchInput {
     pick_up: GeoPoint,
     vehicle_types: Vec<String>,
     mode: DispatchMode,
-    // Widens with each search of the same order (SEARCH_RADIUS_KM).
-    radius_km: f64,
-    // DB time the search began; only offers made after it count as this search's refusals.
-    started_at: DateTime<Utc>,
+    // Which search of this order this is; sets the starting radius (search_radius_km).
+    attempt: i32,
 }
 
-// Also counts this search against the ride request, which sets its radius.
-fn load_search_input(connection: &mut PgConnection, order_id: i64) -> Result<SearchInput, String> {
+// A new search also counts as an attempt against the ride request, which sets its radius; a
+// resumed one carries on as the attempt it was.
+fn load_search_input(connection: &mut PgConnection, order_id: i64, new_attempt: bool) -> Result<SearchInput, String> {
     use crate::schema::app_delivery_orders::dsl as o;
     use crate::schema::back_ride_request::dsl as r;
 
@@ -270,25 +340,27 @@ fn load_search_input(connection: &mut PgConnection, order_id: i64) -> Result<Sea
         .map_err(|e| e.to_string())?;
     let order_ref = order_ref.ok_or("order has no order_ref")?;
 
-    let (pick_up, ride_type, attempt) = diesel::update(r::back_ride_request.filter(r::order_ref.eq(order_ref)))
-        .set(r::search_attempts.eq(r::search_attempts + 1))
-        .returning((r::pick_up, r::ride_type, r::search_attempts))
-        .get_result::<(serde_json::Value, serde_json::Value, i32)>(connection)
-        .map_err(|e| format!("no ride request for order: {}", e))?;
+    let request = r::back_ride_request.filter(r::order_ref.eq(order_ref));
+    let found = if new_attempt {
+        diesel::update(request)
+            .set(r::search_attempts.eq(r::search_attempts + 1))
+            .returning((r::pick_up, r::ride_type, r::search_attempts))
+            .get_result::<(serde_json::Value, serde_json::Value, i32)>(connection)
+    } else {
+        request
+            .select((r::pick_up, r::ride_type, r::search_attempts))
+            .first::<(serde_json::Value, serde_json::Value, i32)>(connection)
+    };
+    let (pick_up, ride_type, attempt) = found.map_err(|e| format!("no ride request for order: {}", e))?;
 
     let pick_up: GeoPoint = serde_json::from_value(pick_up).map_err(|e| format!("bad pick_up: {}", e))?;
     let ride_type: RideType = serde_json::from_value(ride_type).map_err(|e| format!("bad ride_type: {}", e))?;
-
-    let started_at = diesel::select(sql::<Timestamptz>("now()"))
-        .get_result::<DateTime<Utc>>(connection)
-        .map_err(|e| e.to_string())?;
 
     Ok(SearchInput {
         pick_up,
         vehicle_types: ride_type.vehicle_types(),
         mode: dispatch_mode(&source),
-        radius_km: search_radius_km(attempt),
-        started_at,
+        attempt,
     })
 }
 
@@ -308,11 +380,12 @@ fn order_still_searching(connection: &mut PgConnection, order_id: i64) -> Result
 // The closest drivers who can take the order, nearest first, capped at DRIVERS_PER_ROUND.
 // Eligible means online with a free slot by their live order count (busy is included because
 // the stored status can lag a delivery finishing in the app), in range of the pickup, not
-// already passed over during this search, and not holding a live offer for another order.
+// passed over for this order in the last RETRY_DRIVER_AFTER_MINS, and not holding a live offer
+// for another order.
 // Drivers whose last position is older than this are left out of the search.
 const LOCATION_STALE_MINS: u32 = 10;
 
-fn load_candidates(connection: &mut PgConnection, order_id: i64, input: &SearchInput) -> Result<Vec<Driver>, String> {
+fn load_candidates(connection: &mut PgConnection, order_id: i64, input: &SearchInput, radius_km: f64) -> Result<Vec<Driver>, String> {
     use crate::schema::back_drivers::dsl as d;
     use crate::schema::app_ride_offers::dsl as ro;
     use crate::schema::app_delivery_orders::dsl as o;
@@ -321,7 +394,9 @@ fn load_candidates(connection: &mut PgConnection, order_id: i64, input: &SearchI
         .filter(
             ro::order_id.eq(order_id)
                 .and(ro::status.eq_any(vec!["rejected", "expired"]))
-                .and(ro::created_at.ge(input.started_at))
+                .and(ro::created_at.gt(sql::<Timestamptz>(&format!(
+                    "now() - interval '{} minutes'", RETRY_DRIVER_AFTER_MINS
+                ))))
             .or(ro::status.eq("pending").and(ro::expires_at.gt(diesel::dsl::now)))
         )
         .select(ro::driver_id)
@@ -345,7 +420,7 @@ fn load_candidates(connection: &mut PgConnection, order_id: i64, input: &SearchI
         .filter_map(|driver| {
             let location: GeoPoint = serde_json::from_value(driver.driver_location.clone()).ok()?;
             let distance = distance_between(&location, &input.pick_up);
-            (distance <= input.radius_km).then_some((distance, driver))
+            (distance <= radius_km).then_some((distance, driver))
         })
         .collect();
 
@@ -534,12 +609,17 @@ async fn wait_for_driver(rx: oneshot::Receiver<()>, window_secs: u64) {
 // Background driver search for an order. Works through the closest drivers one at a time in
 // the order's dispatch mode until one takes it or the search window closes, in which case the
 // order is marked no_driver.
-pub async fn run_assign_driver(pool: web::Data<DbPool>, order_id: i64) {
-    let deadline = Instant::now() + Duration::from_secs(SEARCH_WINDOW_SECS);
+// `resume`: seconds this order has already searched (a search picked up by the sweep), which
+// shortens the window and keeps the radius it had reached.
+pub async fn run_assign_driver(pool: web::Data<DbPool>, order_id: i64, resume: Option<u64>) {
+    let already = resume.unwrap_or(0);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(SEARCH_WINDOW_SECS.saturating_sub(already));
+    let searched_secs = move || already + started.elapsed().as_secs();
 
-    let input = match with_conn(&pool, move |conn| load_search_input(conn, order_id)).await {
+    let input = match with_conn(&pool, move |conn| load_search_input(conn, order_id, resume.is_none())).await {
         Ok(input) => {
-            println!("Order {}: searching within {}km of the pickup", order_id, input.radius_km);
+            println!("Order {}: searching within {}km of the pickup", order_id, search_radius_km(input.attempt, already));
             std::sync::Arc::new(input)
         }
         Err(e) => {
@@ -552,7 +632,15 @@ pub async fn run_assign_driver(pool: web::Data<DbPool>, order_id: i64) {
         DispatchMode::Assigned => ASSIGNED_START_SECS,
     });
 
+    let mut radius_km = search_radius_km(input.attempt, already);
+
     'search: while Instant::now() < deadline {
+        let widened = search_radius_km(input.attempt, searched_secs());
+        if widened != radius_km {
+            radius_km = widened;
+            println!("Order {}: widening the search to {}km", order_id, radius_km);
+        }
+
         match with_conn(&pool, move |conn| order_still_searching(conn, order_id)).await {
             Ok(true) => {},
             Ok(false) => {
@@ -564,7 +652,7 @@ pub async fn run_assign_driver(pool: web::Data<DbPool>, order_id: i64) {
 
         let candidates = {
             let input = input.clone();
-            match with_conn(&pool, move |conn| load_candidates(conn, order_id, &input)).await {
+            match with_conn(&pool, move |conn| load_candidates(conn, order_id, &input, radius_km)).await {
                 Ok(list) => list,
                 Err(e) => {
                     eprintln!("Order {}: driver lookup failed: {}", order_id, e);
@@ -651,14 +739,24 @@ pub fn validate_rider_account(
 }
 
 // Price and time for one ride type. Quoted before payment; the checkout charges this price.
-pub fn quote(pick_up: &GeoPoint, drop_off: &GeoPoint, ride_type: &RideType) -> RideQuote {
+// The price for a route, ride type and package. Every place that prices a trip (quote screen,
+// checkout, ride request, the stored request) calls this with the same items, so they agree.
+pub fn quote(pick_up: &GeoPoint, drop_off: &GeoPoint, ride_type: &RideType, items: &[ItemDetails]) -> RideQuote {
     let distance_km = distance_between(pick_up, drop_off);
     let estimated_time_min = pricing::estimated_time_min(distance_km, ride_type);
-    let estimated_price = match ride_type {
+    let base = match ride_type {
         RideType::ASAP => pricing::calculate_asap(distance_km, estimated_time_min),
         RideType::ASAPEXPRESS => pricing::calculate_express(distance_km, estimated_time_min),
     };
-    RideQuote { ride_type: ride_type.clone(), estimated_price, original_price: None, estimated_time_min, distance_km }
+    let insurance = pricing::insurance_premium(items);
+    RideQuote {
+        ride_type: ride_type.clone(),
+        estimated_price: base + insurance,
+        original_price: None,
+        estimated_time_min,
+        distance_km,
+        insurance,
+    }
 }
 
 // The app's quote screen: price and time for every ride type, used to build the ride request.
@@ -667,8 +765,8 @@ pub async fn ride_quote(
     pool: web::Data<DbPool>,
     body: web::Json<QuoteRequest>,
 ) -> HttpResponse {
-    let QuoteRequest { pick_up, drop_off } = body.into_inner();
-    if let Err(msg) = validate_points(&pick_up, &drop_off) {
+    let QuoteRequest { pick_up, drop_off, items } = body.into_inner();
+    if let Err(msg) = validate_points(&pick_up, &drop_off).and_then(|_| validate_items(&items)) {
         return json_error(StatusCode::BAD_REQUEST, msg);
     }
     let (pick, drop) = (pick_up.clone(), drop_off.clone());
@@ -677,7 +775,7 @@ pub async fn ride_quote(
     }
     let quotes: Vec<RideQuote> = [RideType::ASAP, RideType::ASAPEXPRESS]
         .iter()
-        .map(|ride_type| quote(&pick_up, &drop_off, ride_type))
+        .map(|ride_type| quote(&pick_up, &drop_off, ride_type, &items))
         .collect();
     HttpResponse::Ok().json(quotes)
 }
@@ -809,7 +907,7 @@ async fn app_ride_request(pool: &web::Data<DbPool>, user_id: Uuid, req: CreateRi
     }
 
     // The money must have arrived and cover this request's price (ride type and distance).
-    let price = quote(&req.pick_up, &req.drop_off, &req.ride_type).estimated_price;
+    let price = quote(&req.pick_up, &req.drop_off, &req.ride_type, &req.items).estimated_price;
     paid_app_order(&order, price).await?;
 
     let order_id = order.id;
@@ -871,6 +969,7 @@ pub fn routes() -> Scope {
         .route("/assign-driver", web::post().to(assign_driver_handler))
         .route("/ride-request", web::post().to(request_ride))
         .route("/ride-quote", web::post().to(ride_quote))
+        .route("/profile", web::post().to(crate::api::profile::update_profile))
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -882,8 +981,8 @@ pub enum RideType {
 impl RideType {
     pub fn vehicle_types(&self) -> Vec<String> {
         match self {
-            RideType::ASAP => vec!["EV".to_string()],
-            RideType::ASAPEXPRESS => vec!["Bike".to_string()],
+            RideType::ASAP => vec!["Bike".to_string()],
+            RideType::ASAPEXPRESS => vec!["EV".to_string()],
         }
     }
 }
@@ -908,6 +1007,10 @@ impl OrderSource {
 pub struct QuoteRequest {
     pub pick_up: GeoPoint,
     pub drop_off: GeoPoint,
+    // Empty for the first quote (route only); sent again with the items once they're entered,
+    // so the price is the package's.
+    #[serde(default)]
+    pub items: Vec<ItemDetails>,
 }
 
 // Matches the app's RideQuote type.
@@ -919,6 +1022,9 @@ pub struct RideQuote {
     pub original_price: Option<i64>,
     pub estimated_time_min: i32,
     pub distance_km: f64,
+    // Naira, already inside estimated_price: the package insurance (pricing::insurance_premium).
+    // 0 for the route-only quote.
+    pub insurance: i64,
 }
 
 #[derive(Deserialize)]
@@ -1005,6 +1111,23 @@ fn normalize_optional_phone(field: &str, value: Option<String>) -> Result<Option
     }
 }
 
+// Each item, then the whole load: the quote checks the same as the ride request, so a quoted
+// package is one that can be booked.
+pub fn validate_items(items: &[ItemDetails]) -> Result<(), String> {
+    for item in items {
+        item.validate()?;
+    }
+    let total_items: u32 = items.iter().map(|item| item.quantity).sum();
+    if total_items > MAX_TOTAL_ITEMS {
+        return Err(format!("Too many items: {} (at most {})", total_items, MAX_TOTAL_ITEMS));
+    }
+    let total_weight: f64 = items.iter().map(|item| item.weight * item.quantity as f64).sum();
+    if total_weight > MAX_TOTAL_WEIGHT_KG {
+        return Err(format!("Too heavy: {:.1}kg in total (at most {}kg)", total_weight, MAX_TOTAL_WEIGHT_KG));
+    }
+    Ok(())
+}
+
 impl CreateRideRequest {
     // Shape checks that need no DB. Normalises phone numbers to E.164 and blank strings to None.
     pub fn validate(&mut self) -> Result<(), String> {
@@ -1013,17 +1136,7 @@ impl CreateRideRequest {
         if self.items.is_empty() {
             return Err("items must list at least one item".into());
         }
-        for item in &self.items {
-            item.validate()?;
-        }
-        let total_items: u32 = self.items.iter().map(|item| item.quantity).sum();
-        if total_items > MAX_TOTAL_ITEMS {
-            return Err(format!("Too many items: {} (at most {})", total_items, MAX_TOTAL_ITEMS));
-        }
-        let total_weight: f64 = self.items.iter().map(|item| item.weight * item.quantity as f64).sum();
-        if total_weight > MAX_TOTAL_WEIGHT_KG {
-            return Err(format!("Too heavy: {:.1}kg in total (at most {}kg)", total_weight, MAX_TOTAL_WEIGHT_KG));
-        }
+        validate_items(&self.items)?;
 
         self.customer_phone = normalize_optional_phone("customer_phone", self.customer_phone.take())?;
         self.pickup_contact_phone = normalize_optional_phone("pickup_contact_phone", self.pickup_contact_phone.take())?;
@@ -1060,7 +1173,7 @@ pub struct NewRideRequest {
 
 impl NewRideRequest {
     pub fn new(req: &CreateRideRequest, rider_id: Uuid, order_ref: Uuid) -> Result<Self, String> {
-        let quote = quote(&req.pick_up, &req.drop_off, &req.ride_type);
+        let quote = quote(&req.pick_up, &req.drop_off, &req.ride_type, &req.items);
         let json = |value: Result<serde_json::Value, serde_json::Error>, field: &str| {
             value.map_err(|e| format!("could not store {}: {}", field, e))
         };
@@ -1112,13 +1225,17 @@ pub struct RideRequest {
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct ItemDetails {
     pub name: String,
-    // Naira; the app may send decimals.
+    // Naira, the declared value of the whole line (not per unit); the app may send decimals.
     pub price: f64,
     pub dimensions: (f64, f64, f64), // (length, width, height) in cm
     pub quantity: u32,
     pub weight: f64, // in kg, per unit
     #[serde(default)]
     pub image_url: Option<String>,
+    // The package type from the app's item type screen; `type` on the wire. Prices the trip
+    // (pricing::package_type_factor). None before the customer picks one.
+    #[serde(default, rename = "type")]
+    pub package_type: Option<String>,
 }
 
 impl ItemDetails {
@@ -1128,6 +1245,9 @@ impl ItemDetails {
         }
         if !self.price.is_finite() || self.price < 0.0 {
             return Err(format!("'{}' has an invalid price", self.name));
+        }
+        if self.package_type.as_deref().map_or(false, pricing::is_blocked_type) {
+            return Err(format!("'{}': hazardous or restricted items can't be delivered", self.name));
         }
         self.max_dimensions()?;
         self.aggregate_quantity()?;
@@ -1178,7 +1298,7 @@ mod tests {
     use super::*;
 
     fn item(dimensions: (f64, f64, f64)) -> ItemDetails {
-        ItemDetails { name: "Box".into(), price: 1000.0, dimensions, quantity: 1, weight: 1.0, image_url: None }
+        ItemDetails { name: "Box".into(), price: 1000.0, dimensions, quantity: 1, weight: 1.0, image_url: None, package_type: None }
     }
 
     #[test]
@@ -1194,11 +1314,21 @@ mod tests {
 
     #[test]
     fn search_radius_widens_per_attempt() {
-        assert_eq!(search_radius_km(0), 5.0);
-        assert_eq!(search_radius_km(1), 5.0);
-        assert_eq!(search_radius_km(2), 8.0);
-        assert_eq!(search_radius_km(3), 12.0);
-        assert_eq!(search_radius_km(9), 12.0);
+        assert_eq!(search_radius_km(0, 0), 5.0);
+        assert_eq!(search_radius_km(1, 0), 5.0);
+        assert_eq!(search_radius_km(2, 0), 8.0);
+        assert_eq!(search_radius_km(3, 0), 12.0);
+        assert_eq!(search_radius_km(9, 0), 12.0);
+    }
+
+    #[test]
+    fn search_radius_widens_every_three_minutes_up_to_twelve() {
+        assert_eq!(search_radius_km(1, 179), 5.0);
+        assert_eq!(search_radius_km(1, 180), 8.0);
+        assert_eq!(search_radius_km(1, 360), 12.0);
+        assert_eq!(search_radius_km(1, 1800), 12.0);
+        // A Try again starts wider and still caps at 12.
+        assert_eq!(search_radius_km(2, 180), 12.0);
     }
 
     #[test]

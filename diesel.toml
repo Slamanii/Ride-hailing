@@ -10,6 +10,7 @@ filter = { only_tables = [
     "^back_custom_users$",
     "^back_drivers$",
     "^back_ride_request$",
+    "^back_service_areas$",
     "^back_trips$",
     "^app_custom_users$",
     "^app_delivery_orders$",

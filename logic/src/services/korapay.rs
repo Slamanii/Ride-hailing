@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::db::DbPool;
 use crate::api::errors::{ ApiError, blocking, json_error };
 use crate::api::orders::{ OrderKey, OrderRow, cancel_unpaid, close_trip, load_order, paid_amount, payout_failed };
-use crate::api::riders::{ RideType, OrderSource, quote, same_place, validate_points, validate_rider_account };
+use crate::api::riders::{ ItemDetails, RideType, OrderSource, quote, same_place, validate_items, validate_points, validate_rider_account };
 use crate::services::auth::AuthUser;
 use crate::services::{ codes, escrow };
 use crate::services::areas::require_service_area;
@@ -24,9 +24,14 @@ use crate::services::pricing::GeoPoint;
 // The order itself is created by the app (create_order RPC, awaiting_payment); this file only
 // attaches the payment to it.
 
-// The driver's share of what the customer paid, in basis points (68.25%). The rest stays in the
-// holding account.
-const DRIVER_SHARE_BPS: i64 = 6825;
+// The driver's share of what the customer paid, in basis points:
+//   trip on an investment asset (back_trips.asset_id): driver 55, asset account 14, treasury 31
+//   any other trip:                                    driver 85, treasury 15
+// Only the driver's share leaves per trip; the rest stays in the holding account.
+const DRIVER_SHARE_BPS: i64 = 8500;
+const ASSET_TRIP_DRIVER_SHARE_BPS: i64 = 5500;
+// The asset account's share of an asset trip (the investors' pool); reported, not paid per trip.
+pub const ASSET_POOL_BPS: i64 = 1400;
 
 fn env_required(name: &str) -> Result<String, String> {
     env::var(name)
@@ -81,7 +86,7 @@ async fn post<T: for<'de> Deserialize<'de>>(path: &str, body: &Value) -> Result<
 
 // Money going out is referenced from the payment, so a retry is the same transfer and Korapay
 // won't send it twice. Korapay caps references at 50 characters.
-fn derived_reference(prefix: &str, payment_reference: &str) -> String {
+pub(crate) fn derived_reference(prefix: &str, payment_reference: &str) -> String {
     let mut reference = format!("{}_{}", prefix, payment_reference);
     reference.truncate(50);
     reference
@@ -94,13 +99,14 @@ struct CheckoutData {
     checkout_url: String,
 }
 
-async fn initialize_charge(reference: &str, amount_naira: i64, email: &str, name: &str, redirect_url: &str, metadata: Value) -> Result<String, String> {
+// Orders here; investment slots in services::invest.
+pub(crate) async fn initialize_charge(reference: &str, amount_naira: i64, email: &str, name: &str, redirect_url: &str, narration: &str, metadata: Value) -> Result<String, String> {
     let body = json!({
         "amount": amount_naira,
         "currency": "NGN",
         "reference": reference,
         "redirect_url": redirect_url,
-        "narration": "ASAP delivery",
+        "narration": narration,
         "customer": { "email": email, "name": name },
         "metadata": metadata,
     });
@@ -113,14 +119,19 @@ async fn initialize_charge(reference: &str, amount_naira: i64, email: &str, name
 
 #[derive(Deserialize)]
 pub struct InitializeRequest {
-    // The awaiting_payment order the app created with create_order.
-    pub order_ref: Uuid,
+    // The awaiting_payment order the app created with create_order. Optional only so a missing
+    // one gets a clear message instead of a JSON error.
+    #[serde(default)]
+    pub order_ref: Option<Uuid>,
     pub pick_up: GeoPoint,
     pub drop_off: GeoPoint,
     pub ride_type: RideType,
     // estimated_price from /riders/ride-quote; re-checked here.
     #[serde(alias = "estimated_price")]
     pub price: i64,
+    // The items the quote was for; their package types are part of the price.
+    #[serde(default)]
+    pub items: Vec<ItemDetails>,
     // Where Korapay sends the customer after the payment window.
     pub redirect_url: String,
 }
@@ -167,7 +178,9 @@ pub async fn initialize(
         return json_error(StatusCode::BAD_REQUEST, msg);
     }
 
-    let order_ref = req.order_ref;
+    let Some(order_ref) = req.order_ref else {
+        return json_error(StatusCode::BAD_REQUEST, "order_ref is required: create the order (create_order) before paying");
+    };
     let (pick_up, drop_off) = (req.pick_up.clone(), req.drop_off.clone());
     let loaded = blocking(&pool, move |conn| {
         require_service_area(conn, &pick_up, &drop_off)?;
@@ -185,7 +198,11 @@ pub async fn initialize(
     if !same_place(order.pick_up(), &req.pick_up) || !same_place(order.drop_off(), &req.drop_off) {
         return json_error(StatusCode::CONFLICT, "pick_up or drop_off differs from the order");
     }
-    let price = quote(&req.pick_up, &req.drop_off, &req.ride_type).estimated_price;
+    if let Err(msg) = validate_items(&req.items) {
+        return json_error(StatusCode::BAD_REQUEST, msg);
+    }
+    let quoted = quote(&req.pick_up, &req.drop_off, &req.ride_type, &req.items);
+    let (price, insurance) = (quoted.estimated_price, quoted.insurance);
     if price != req.price {
         return json_error(StatusCode::CONFLICT, format!("Price has changed: this trip now costs {}; quote again", price));
     }
@@ -204,13 +221,14 @@ pub async fn initialize(
 
     let reference = format!("asap_{}", Uuid::new_v4().simple());
     let metadata = json!({ "order_ref": order_ref, "order_id": order.id });
-    let checkout_url = match initialize_charge(&reference, price, &rider.email, &rider.name, &redirect_url, metadata).await {
+    let checkout_url = match initialize_charge(&reference, price, &rider.email, &rider.name, &redirect_url, "ASAP delivery", metadata).await {
         Ok(url) => url,
         Err(e) => return ApiError::BadGateway(format!("Could not start the payment: {}", e)).response(),
     };
 
     // Guarded on the reference it read, so two initialize calls can't both attach a charge.
     // Codes already on the row are kept (COALESCE), so the pair is written together or not at all.
+    // insurance is the part of price that is package insurance.
     let previous = order.payment_reference.clone();
     let order_id = order.id;
     let (pickup_code, dropoff_code) = codes::code_pair();
@@ -218,7 +236,7 @@ pub async fn initialize(
         let reference = reference.clone();
         move |conn| Ok(diesel::sql_query(
             "UPDATE app_delivery_orders SET \
-                payment_reference = $2, price = CAST($3 AS numeric), \
+                payment_reference = $2, price = CAST($3 AS numeric), insurance = CAST($7 AS numeric), \
                 pickup_code = COALESCE(pickup_code, $4), dropoff_code = COALESCE(dropoff_code, $5), \
                 modified_at = now() \
              WHERE id = $1 AND status = 'awaiting_payment' AND payment_reference IS NOT DISTINCT FROM $6"
@@ -229,6 +247,7 @@ pub async fn initialize(
         .bind::<Text, _>(&pickup_code)
         .bind::<Text, _>(&dropoff_code)
         .bind::<Nullable<Text>, _>(previous.as_deref())
+        .bind::<BigInt, _>(insurance)
         .execute(conn)?)
     }).await;
 
@@ -414,7 +433,7 @@ pub async fn query_payout(reference: &str) -> Result<TransferStatus, String> {
 }
 
 // A refund, by its rf_ reference.
-async fn query_refund(reference: &str) -> Result<TransferStatus, String> {
+pub(crate) async fn query_refund(reference: &str) -> Result<TransferStatus, String> {
     query_transfer("refunds", reference).await
 }
 
@@ -463,8 +482,8 @@ pub async fn refund(payment_reference: &str, amount_naira: i64, reason: &str) ->
     }
 }
 
-// Holding account -> bank account.
-async fn disburse(reference: &str, amount_naira: f64, bank_code: &str, account_number: &str, name: &str, email: &str, narration: &str) -> Result<(), String> {
+// Holding account -> bank account. Drivers here; investors' withdrawals in services::invest.
+pub(crate) async fn disburse(reference: &str, amount_naira: f64, bank_code: &str, account_number: &str, name: &str, email: &str, narration: &str) -> Result<(), String> {
     let body = json!({
         "reference": reference,
         "destination": {
@@ -490,8 +509,13 @@ fn to_kobo(naira: f64) -> i64 {
 
 // The driver's cut of what was paid, in kobo, rounded down. Whole-number maths, so the
 // split never drifts by a kobo.
-fn driver_share_kobo(paid_kobo: i64) -> i64 {
-    paid_kobo * DRIVER_SHARE_BPS / 10_000
+fn driver_share_kobo(paid_kobo: i64, asset_trip: bool) -> i64 {
+    paid_kobo * driver_share_bps(asset_trip) / 10_000
+}
+
+// Also sent to Zazu, which pays its own drivers by the same split.
+pub fn driver_share_bps(asset_trip: bool) -> i64 {
+    if asset_trip { ASSET_TRIP_DRIVER_SHARE_BPS } else { DRIVER_SHARE_BPS }
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -530,6 +554,7 @@ struct CreditTarget {
     email: String,
     account_number: Option<String>,
     bank_code: Option<String>,
+    asset_trip: bool,
 }
 
 // Pays the driver their share of a delivered app order, from what the customer actually paid,
@@ -557,8 +582,22 @@ pub async fn credit_driver(pool: &web::Data<DbPool>, order_id: i64) -> DriverCre
             .find(driver_id)
             .select((d::name, d::email, d::account_number, d::bank_code))
             .first::<(String, String, Option<String>, Option<String>)>(conn)?;
+        // Stamped at pickup and never changed, so a retried payout works out the same amount.
+        let asset_trip = match order.order_ref {
+            Some(order_ref) => {
+                use crate::schema::back_trips::dsl as t;
+                t::back_trips
+                    .filter(t::order_ref.eq(order_ref))
+                    .select(t::asset_id)
+                    .first::<Option<Uuid>>(conn)
+                    .optional()?
+                    .flatten()
+                    .is_some()
+            }
+            None => false,
+        };
 
-        Ok(Some(CreditTarget { order_ref: order.order_ref, payment_reference, order_code, name, email, account_number, bank_code }))
+        Ok(Some(CreditTarget { order_ref: order.order_ref, payment_reference, order_code, name, email, account_number, bank_code, asset_trip }))
     }).await;
 
     let target = match target {
@@ -572,7 +611,7 @@ pub async fn credit_driver(pool: &web::Data<DbPool>, order_id: i64) -> DriverCre
         Err(e) => return DriverCredit::failed(0.0, e),
     };
 
-    let share_kobo = driver_share_kobo(to_kobo(paid));
+    let share_kobo = driver_share_kobo(to_kobo(paid), target.asset_trip);
     let amount = share_kobo as f64 / 100.0;
     if share_kobo <= 0 {
         return DriverCredit::failed(0.0, "Driver share is zero");
@@ -857,6 +896,8 @@ pub fn spawn_stale_order_sweep(pool: web::Data<DbPool>) {
             sweep_no_driver(&pool).await;
             sweep_late_payments(&pool).await;
             sweep_payouts(&pool).await;
+            crate::api::disputes::sweep_dispute_refunds(&pool).await;
+            crate::services::sessions::sweep_sessions(&pool).await;
         }
     });
 }
@@ -949,10 +990,12 @@ mod tests {
     }
 
     #[test]
-    fn driver_gets_68_25_percent_rounded_down_to_the_kobo() {
+    fn driver_share_rounds_down_to_the_kobo() {
         assert_eq!(to_kobo(1999.0), 199_900);
-        assert_eq!(driver_share_kobo(199_900), 136_431); // ₦1,364.31
-        assert_eq!(driver_share_kobo(100_000), 68_250);  // ₦682.50
-        assert_eq!(driver_share_kobo(1), 0);
+        assert_eq!(driver_share_kobo(199_900, false), 169_915); // 85%: ₦1,699.15
+        assert_eq!(driver_share_kobo(199_900, true), 109_945);  // 55%: ₦1,099.45
+        assert_eq!(driver_share_kobo(100_000, false), 85_000);
+        assert_eq!(driver_share_kobo(100_000, true), 55_000);
+        assert_eq!(driver_share_kobo(1, false), 0);
     }
 }

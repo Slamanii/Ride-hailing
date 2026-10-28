@@ -64,6 +64,7 @@ diesel::table! {
         cancelled_by -> Nullable<Uuid>,
         order_ref -> Nullable<Uuid>,
         price -> Nullable<Numeric>,
+        insurance -> Nullable<Numeric>,
     }
 }
 
@@ -173,6 +174,7 @@ diesel::table! {
         bank_code -> Nullable<Text>,
         tier -> Nullable<Text>,
         location_updated_at -> Nullable<Timestamptz>,
+        plate_number -> Nullable<Text>,
     }
 }
 
@@ -197,6 +199,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    back_service_areas (id) {
+        id -> Int4,
+        city -> Text,
+        center_lat -> Float8,
+        center_lng -> Float8,
+        radius_km -> Float8,
+        active -> Bool,
+        created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     back_trips (trip_id) {
         trip_id -> Bytea,
         rider_id -> Uuid,
@@ -216,6 +230,7 @@ diesel::table! {
         fare_lamports -> Nullable<Int8>,
         order_ref -> Nullable<Uuid>,
         rider_email -> Text,
+        asset_id -> Nullable<Uuid>,
     }
 }
 
@@ -237,5 +252,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     back_custom_users,
     back_drivers,
     back_ride_request,
+    back_service_areas,
     back_trips,
 );

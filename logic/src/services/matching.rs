@@ -51,6 +51,9 @@ pub async fn process_geolocation(
         match kind {
             GeoPointKind::DriverLocation => {
                 let rows = update_driver_location(conn, me, &gp)?;
+                if rows > 0 {
+                    crate::services::sessions::record_ping(conn, me);
+                }
                 Ok((rows, check_dropoff_arrival(conn, me, new_lat, new_lng)?))
             }
             GeoPointKind::PickUp => Ok((update_request_pickup(conn, id, me, &gp)?, Vec::new())),

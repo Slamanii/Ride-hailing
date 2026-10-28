@@ -6,6 +6,10 @@ pub mod drivers;
 pub mod trips;
 pub mod orders;
 pub mod errors;
+pub mod applications;
+pub mod disputes;
+pub mod dashboard;
+pub mod profile;
 
 
 pub fn init(cfg: &mut ServiceConfig) {

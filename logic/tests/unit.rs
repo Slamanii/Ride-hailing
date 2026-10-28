@@ -181,6 +181,7 @@ fn make_item(length: f64, width: f64, height: f64, weight: f64, quantity: u32) -
         quantity,
         weight,
         image_url: None,
+        package_type: None,
     }
 }
 

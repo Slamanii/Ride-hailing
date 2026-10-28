@@ -32,9 +32,18 @@ const ORDER_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 // Short human-facing order code, e.g. "K7PX3QMA". Unique in the DB; callers retry on a clash.
 pub fn order_code() -> String {
+    random_code(8)
+}
+
+// An investment asset's public code, e.g. "EV-7K3Q". Unique in the DB; callers retry on a clash.
+pub fn asset_code(prefix: &str) -> String {
+    format!("{}-{}", prefix, random_code(4))
+}
+
+fn random_code(len: usize) -> String {
     let mut n = random_u128();
     let base = ORDER_CODE_ALPHABET.len() as u128;
-    (0..8)
+    (0..len)
         .map(|_| {
             let c = ORDER_CODE_ALPHABET[(n % base) as usize] as char;
             n /= base;
@@ -57,6 +66,11 @@ mod tests {
             let order = order_code();
             assert_eq!(order.len(), 8);
             assert!(order.bytes().all(|c| ORDER_CODE_ALPHABET.contains(&c)));
+
+            let asset = asset_code("EV");
+            assert_eq!(asset.len(), 7);
+            assert!(asset.starts_with("EV-"));
+            assert!(asset[3..].bytes().all(|c| ORDER_CODE_ALPHABET.contains(&c)));
         }
     }
 

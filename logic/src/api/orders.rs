@@ -218,7 +218,7 @@ pub fn open_trip(conn: &mut PgConnection, order_id: i64) -> QueryResult<()> {
     let opened = diesel::sql_query(
         "INSERT INTO back_trips (trip_id, rider_id, reference, pick_up, drop_off, driver_location, \
             rider_pubkey, driver_pubkey, driver_id, status, start_ts, end_ts, distance_km, item, \
-            fare_estimate, fare_lamports, order_ref, rider_email) \
+            fare_estimate, fare_lamports, order_ref, rider_email, asset_id) \
          SELECT sha256(convert_to(o.order_ref::text, 'UTF8')), o.client_id, \
             COALESCE(o.payment_reference, o.order_code), \
             jsonb_build_object('lat', o.pickup_lat::float8, 'lng', o.pickup_long::float8, 'name', o.pickup_name), \
@@ -228,7 +228,10 @@ pub fn open_trip(conn: &mut PgConnection, order_id: i64) -> QueryResult<()> {
             CASE WHEN d.driver_pubkey #>> '{}' ~ $2 THEN d.driver_pubkey #>> '{}' END, \
             d.driver_id, 'Ongoing', \
             extract(epoch from now())::int8, NULL, COALESCE(rr.distance_km, 0), COALESCE(rr.items, '[]'::jsonb), \
-            COALESCE(round(o.price)::int8, rr.estimated_price), NULL, o.order_ref, r.email \
+            COALESCE(round(o.price)::int8, rr.estimated_price), NULL, o.order_ref, r.email, \
+            (SELECT aa.asset_id FROM asset_assignments aa \
+               JOIN invest_assets ia ON ia.id = aa.asset_id AND ia.status = 'active' \
+              WHERE aa.driver_id = d.driver_id AND aa.ended_at IS NULL) \
          FROM app_delivery_orders o \
          JOIN back_custom_users r ON r.rider_id = o.client_id \
          JOIN back_drivers d ON d.driver_id = o.driver_id \
@@ -283,6 +286,10 @@ pub fn close_trip(conn: &mut PgConnection, order_ref: Option<Uuid>, status: &'st
         t::end_ts.eq(Some(Utc::now().timestamp())),
     ))
     .execute(conn)?;
+    // A completed trip on an investment asset credits its slot owners (invest_trip_earnings).
+    if updated > 0 && status == "Completed" {
+        crate::services::invest::record_trip_earnings(conn, order_ref);
+    }
     Ok(updated > 0)
 }
 
